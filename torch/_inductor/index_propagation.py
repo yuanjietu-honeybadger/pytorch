@@ -24,6 +24,7 @@ SymPy expressions yet, despite sympy.Min and sympy.Max existing.
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
+from math import floor, sqrt
 from typing import Any, Literal, overload, TypeAlias
 
 import sympy
@@ -61,9 +62,8 @@ def _is_large_constant(val: _ExprType) -> bool:
             return False
         val = float(val)
 
-    # Threshold: Use a fraction of INT32_MAX to leave headroom for index arithmetic
-    INT32_MAX = 2_147_483_647
-    INT32_SAFE_THRESHOLD = INT32_MAX // 16
+    # Use of a threshold INT32_MAX that is safe for mul,add,sub of int32's
+    INT32_SAFE_THRESHOLD = floor(sqrt(torch.iinfo(torch.int32).max))
     return abs(val) >= INT32_SAFE_THRESHOLD
 
 
