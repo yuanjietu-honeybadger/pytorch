@@ -24,7 +24,6 @@ SymPy expressions yet, despite sympy.Min and sympy.Max existing.
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
-from math import floor, sqrt
 from typing import Any, Literal, overload, TypeAlias
 
 import sympy
@@ -51,7 +50,8 @@ def _is_constant(val: _ExprType):
 
 def _is_large_constant(val: _ExprType) -> bool:
     """
-    Check if a constant is too large to safely fold with index expressions.
+    Heirustic to indicate whether int operations will not cause buffer
+    overflow. We turn off folding for large integer constants.
     """
     if not _is_constant(val):
         return False
@@ -63,7 +63,7 @@ def _is_large_constant(val: _ExprType) -> bool:
         val = float(val)
 
     # Use of a threshold INT32_MAX that is safe for mul,add,sub of int32's
-    INT32_SAFE_THRESHOLD = floor(sqrt(torch.iinfo(torch.int32).max))
+    INT32_SAFE_THRESHOLD = 50_000
     return abs(val) >= INT32_SAFE_THRESHOLD
 
 
