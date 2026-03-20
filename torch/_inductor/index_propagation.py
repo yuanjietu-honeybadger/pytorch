@@ -48,25 +48,6 @@ def _is_constant(val: _ExprType):
     return isinstance(val, (int, float, bool))
 
 
-def _is_large_constant(val: _ExprType) -> bool:
-    """
-    Heirustic to indicate whether int operations will not cause buffer
-    overflow. We turn off folding for large integer constants.
-    """
-    if not _is_constant(val):
-        return False
-
-    # Get numeric value
-    if isinstance(val, sympy.Basic):
-        if not val.is_number:
-            return False
-        val = float(val)
-
-    # Use of a threshold INT32_MAX that is safe for mul,add,sub of int32's
-    INT32_SAFE_THRESHOLD = 50_000
-    return abs(val) >= INT32_SAFE_THRESHOLD
-
-
 def upper_bound(val: _ExprType):
     return bound_sympy(val).upper if isinstance(val, sympy.Expr) else val
 
@@ -307,11 +288,6 @@ class IndexPropagation(DefaultHandler):
 
         new_args = [unwrap(a) for a in args]
         new_kwargs = {k: unwrap(v) for k, v in kwargs.items()}
-
-        for arg in itertools.chain(new_args, new_kwargs.values()):
-            if isinstance(arg, TypedExpr) and _is_large_constant(arg.expr):
-                return self.fallback(name, args, kwargs)
-
         new_expr = getattr(SymPyOps, name)(*new_args, **new_kwargs)
         is_valid_expr = new_expr is not NotImplemented and (
             # Inductor doesn't expect floating point in sympy expressions, but
