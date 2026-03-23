@@ -12,7 +12,9 @@ import logging
 import math
 import operator
 import os
+import re
 import textwrap
+import typing_extensions
 from abc import abstractmethod
 from collections.abc import Callable, Iterable, Sequence
 from functools import lru_cache
@@ -2115,6 +2117,7 @@ class TritonKernelOverrides(TritonOverrides):
         shape = [1] * ndim
         return cls._shaped_constant(value, dtype, shape=shape)
 
+    @typing_extensions.override
     @classmethod
     def index_expr(cls, expr, dtype):
         expr = _materialize_trunc_to_float_expr(expr, dtype)
@@ -2132,15 +2135,44 @@ class TritonKernelOverrides(TritonOverrides):
         # Our sympy expr printing casts to the current kernel index dtype.
         # we only respect non int32-int64 dtypes and otherwise use current kernel indexing dtype
         index_dtype = V.kernel.get_index_dtype_as_torch_dtype()
-        dtype = dtype if dtype not in (torch.int32, torch.int64) else index_dtype
+
+        # If index is used as value, respect dtype, otherwise use index_dtype.
+        is_for_values = False
+        if isinstance(V.kernel.current_node.node, ir.ComputedBuffer):
+            for origin_node in V.kernel.current_node.node.data.origins:
+                ctx = getattr(origin_node, "_inductor_index_expr_context", None)
+                if (
+                    ctx is not None
+                    and ctx.get("is_for_values", False)
+                    and ctx.get("dtype") == dtype
+                ):
+                    is_for_values = True
+                    break
+
+        # Respect int64 when computing values, even if kernel uses int32 indexing
+        if dtype not in (torch.int32, torch.int64):
+            pass  # non int32-int64 dtypes
+        elif is_for_values and dtype == torch.int64 and index_dtype == torch.int32:
+            pass  # Keep int64 for computing values
+        else:
+            dtype = index_dtype  # Use kernel's index dtype
+
+        # Cast index variables to int64 if computing int64 values with int32 indexing
+        index_str_to_use = indexing.index_str
+        if is_for_values and dtype == torch.int64 and index_dtype == torch.int32:
+            index_str_to_use = re.sub(
+                r"\b(x\d+|xindex)\b",
+                lambda m: f"{m.group(0)}.to(tl.int64)",
+                indexing.index_str,
+            )
 
         # after we emit this var we cast it to the correct dtype
         orig = config.test_configs.runtime_triton_dtype_assert
         try:
             config.test_configs.runtime_triton_dtype_assert = False
-            var = V.kernel.cse.generate(
-                V.kernel.compute,
-                indexing.index_str,
+            var = V.kernel.cse.generate(  # type: ignore[unbound-name]
+                V.kernel.compute,  # type: ignore[unbound-name]
+                index_str_to_use,
                 bounds=get_bounds_index_expr(expr),
                 dtype=dtype,
                 shape=shape,
@@ -2149,8 +2181,8 @@ class TritonKernelOverrides(TritonOverrides):
             config.test_configs.runtime_triton_dtype_assert = orig
 
         if dtype not in (torch.int32, torch.int64):
-            var = V.kernel.cse.generate(
-                V.kernel.compute,
+            var = V.kernel.cse.generate(  # type: ignore[unbound-name]
+                V.kernel.compute,  # type: ignore[unbound-name]
                 cls.to_dtype(var, dtype),
                 dtype=upcast_compute_type(dtype),
                 shape=var.shape,
@@ -2164,12 +2196,13 @@ class TritonKernelOverrides(TritonOverrides):
             for index_var in expr.free_symbols:
                 if symbol_is_type(index_var, SymT.TMP):
                     dtype = torch.promote_types(
-                        dtype, V.kernel.cse.varname_map[index_var.name].dtype
+                        dtype,
+                        V.kernel.cse.varname_map[index_var.name].dtype,  # type: ignore[unbound-name]
                     )
 
             if dtype != index_dtype:
-                var = V.kernel.cse.generate(
-                    V.kernel.compute,
+                var = V.kernel.cse.generate(  # type: ignore[unbound-name]
+                    V.kernel.compute,  # type: ignore[unbound-name]
                     cls.to_dtype(var, index_dtype),
                     dtype=index_dtype,
                     shape=var.shape,
@@ -6073,6 +6106,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             size = ""
         index_dtype = self.index_dtype
         suffix = f".to({index_dtype})" if index_dtype != "tl.int32" else ""
+
         if (
             self.cooperative_reduction
             and self.persistent_reduction

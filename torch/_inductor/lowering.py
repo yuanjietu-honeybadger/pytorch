@@ -3547,6 +3547,47 @@ if hasattr(aten, "lift_fresh_copy"):
     register_lowering(aten.lift_fresh_copy)(clone)
 
 
+def is_used_for_indexing():
+    """Check if current node's result is used for indexing operations"""
+    if not hasattr(V.graph, "current_node") or V.graph.current_node is None:
+        return False
+
+    indexing_ops = {
+        "index": 1,
+        "index_put": 1,
+        "index_put_": 1,
+        "_unsafe_index": 1,
+        "_unsafe_index_put": 1,
+        "take_along_dim": 1,
+        "embedding": 1,
+        "embedding_dense_backward": 1,
+        "take": 1,
+        "gather": 2,
+        "index_select": 2,
+        "index_add": 2,
+        "index_copy": 2,
+        "index_fill": 2,
+        "index_reduce": 2,
+        "scatter": 2,
+        "scatter_add": 2,
+        "scatter_reduce": 2,
+    }
+
+    # Check immediate users
+    for user in V.graph.current_node.users:
+        opname = getattr(user.target, "_opname", None)
+        if opname in indexing_ops:
+            index_arg_pos = indexing_ops[opname]
+            # Check if current node appears at the index argument position
+            if (
+                len(user.args) > index_arg_pos
+                and user.args[index_arg_pos] == V.graph.current_node
+            ):
+                return True
+
+    return False
+
+
 @register_lowering(prims.iota)
 def iota(
     length,
@@ -3557,6 +3598,13 @@ def iota(
     device,
     requires_grad,
 ):
+    is_for_values = not is_used_for_indexing()
+    # Attach context directly to the FX node - it will be preserved via origin_node
+    V.graph.current_node._inductor_index_expr_context = {
+        "is_for_values": is_for_values,
+        "dtype": dtype,
+    }
+
     def fn(index):
         return ops.index_expr(step * index[0] + start, dtype=dtype)
 
