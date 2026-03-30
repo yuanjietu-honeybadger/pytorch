@@ -1,21 +1,31 @@
 # Owner(s): ["oncall: distributed"]
 
+import sys
+
+import torch
+
+
+# Currently this common shmem_triton tests are tested on ROCm platforms only.
+# In a followup refactor test_nvshmem_triton.py can switch to this shmem_triton implementation.
+if torch.version.hip is None:
+    print("rocSHMEM Triton tests run on ROCm only; skipping on non-ROCm CI.")
+    sys.exit(0)
+
 import unittest
 
 import triton.language as tl
 
-import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 import torch.distributed._symmetric_memory._shmem_triton as shmem_triton
 from torch._inductor.runtime.triton_compat import triton
 from torch.testing._internal.common_distributed import MultiProcContinuousTest
-from torch.testing._internal.common_utils import instantiate_parametrized_tests, run_tests
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    run_tests,
+)
 from torch.testing._internal.inductor_utils import IS_H100, requires_triton
 from torch.utils._triton import has_triton
-
-if torch.version.hip is None:
-    raise unittest.SkipTest("Currently run this for rocSHMEM Triton tests on ROCm-only.")
 
 
 shmem_backend = shmem_triton.get_shmem_backend_module()
@@ -65,9 +75,7 @@ class RocShmemBackendMixin(ShmemBackendMixin):
             "test_triton_minmax_reduce",
             "test_triton_prod_reduce",
         }:
-            return (
-                "rocSHMEM *_wg collective symbols are unavailable in current device bitcode for this op."
-            )
+            return "rocSHMEM *_wg collective symbols are unavailable in current device bitcode for this op."
         if op == "test_triton_put_signal_add":
             return "Known hang in rocSHMEM Triton put_signal_add path."
         return None
@@ -100,7 +108,9 @@ def my_putmem_signal_block_kernel(
     sig_op,
     peer,
 ):
-    shmem_backend.putmem_signal_block(dst, src, size_bytes, signal, sig_val, sig_op, peer)
+    shmem_backend.putmem_signal_block(
+        dst, src, size_bytes, signal, sig_val, sig_op, peer
+    )
 
 
 @requires_shmem
@@ -347,7 +357,9 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
             )
             torch.testing.assert_close(
                 flag,
-                torch.tensor([completion_flag_val], dtype=flag_dtype, device=self.device),
+                torch.tensor(
+                    [completion_flag_val], dtype=flag_dtype, device=self.device
+                ),
             )
 
     @requires_triton()
@@ -376,7 +388,9 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
         symm_mem.rendezvous(out2, group=group_name)
         flag = symm_mem.empty(1, dtype=torch.int32, device=self.device).fill_(0)
         symm_mem.rendezvous(flag, group=group_name)
-        flag_update_val = torch.tensor([flag_val], dtype=torch.int32, device=self.device)
+        flag_update_val = torch.tensor(
+            [flag_val], dtype=torch.int32, device=self.device
+        )
 
         if rank == 0:
             my_put_with_fence_kernel[(1,)](
@@ -419,7 +433,9 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
         inp = symm_mem.empty(numel, dtype=dtype, device=self.device).fill_(val)
         out = symm_mem.empty(numel, dtype=dtype, device=self.device).fill_(-1)
         flag = symm_mem.empty(1, dtype=torch.int32, device=self.device).fill_(0)
-        flag_update_val = torch.tensor([flag_val], dtype=torch.int32, device=self.device)
+        flag_update_val = torch.tensor(
+            [flag_val], dtype=torch.int32, device=self.device
+        )
 
         symm_mem.rendezvous(inp, group=group_name)
         symm_mem.rendezvous(out, group=group_name)
@@ -574,13 +590,14 @@ else:
 
 @instantiate_parametrized_tests
 class SHMEMTritonTest(ActiveShmemBackendMixin, ShmemTritonTestBase):
+    @unittest.skipIf(
+        torch.version.hip is not None,
+        "Known hang in rocSHMEM Triton put_signal_add path.",
+    )
     @requires_triton()
     def test_triton_put_signal_add(self) -> None:
-        if torch.version.hip is not None:
-            self.skipTest("Known hang in rocSHMEM Triton put_signal_add path.")
         super().test_triton_put_signal_add()
 
 
 if __name__ == "__main__":
     run_tests()
-

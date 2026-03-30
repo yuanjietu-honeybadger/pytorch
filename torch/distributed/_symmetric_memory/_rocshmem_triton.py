@@ -12,9 +12,8 @@ import sysconfig
 
 import torch
 from torch.distributed._symmetric_memory._shmem_triton import (
-    ShmemKernelRegistry,
-    build_requires_shmem_decorator,
     run_shmem_init_hook,
+    ShmemKernelRegistry,
 )
 from torch.utils._triton import has_triton
 
@@ -66,8 +65,7 @@ class RocshmemLibFinder:
             lib_path = os.path.join(user_lib_dir, lib_name)
             if not os.path.exists(lib_path):
                 raise RuntimeError(
-                    "rocSHMEM device library not found at ROCSHMEM_LIB_DIR: "
-                    f"{lib_path}"
+                    f"rocSHMEM device library not found at ROCSHMEM_LIB_DIR: {lib_path}"
                 )
             logger.info("Found rocSHMEM device library: %s", lib_path)
             cls.found_device_lib_path = lib_path
@@ -117,39 +115,44 @@ def _rocshmem_init_hook(*args, **kwargs) -> None:  # type: ignore[no-untyped-def
     )
 
 
+def requires_rocshmem(  # type: ignore[no-untyped-def]
+    jit_func,
+):
+    """
+    Decorator to mark a Triton kernel as requiring rocSHMEM device APIs.
+
+    Finds the architecture-specific rocSHMEM bitcode library, registers
+    the kernel for post-compile HIP-module initialization, and wraps the
+    function so that ``extern_libs`` is injected automatically.
+
+    Example::
+
+        @requires_rocshmem
+        @triton.jit
+        def my_kernel(...):
+            pe = rocshmem_my_pe()
+            rocshmem_putmem_wg(dest, src, nbytes, target_pe)
+
+    Set ``ROCSHMEM_LIB_DIR`` to override the default library search path.
+    """
+    from torch.distributed._symmetric_memory._shmem_triton import (
+        build_requires_shmem_decorator,
+    )
+
+    return build_requires_shmem_decorator(
+        jit_func=jit_func,
+        find_device_library=RocshmemLibFinder.find_device_library,
+        extern_libs_key="rocshmem",
+        registry=RocshmemKernelRegistry,
+        init_hook=_rocshmem_init_hook,
+        error_prefix="@requires_rocshmem",
+    )
+
+
 if has_triton():
     import triton
     import triton.language as tl
     from triton.language import core
-
-    def requires_rocshmem(  # type: ignore[no-untyped-def]
-        jit_func,
-    ):
-        """
-        Decorator to mark a Triton kernel as requiring rocSHMEM device APIs.
-
-        Finds the architecture-specific rocSHMEM bitcode library, registers
-        the kernel for post-compile HIP-module initialization, and wraps the
-        function so that ``extern_libs`` is injected automatically.
-
-        Example::
-
-            @requires_rocshmem
-            @triton.jit
-            def my_kernel(...):
-                pe = rocshmem_my_pe()
-                rocshmem_putmem_wg(dest, src, nbytes, target_pe)
-
-        Set ``ROCSHMEM_LIB_DIR`` to override the default library search path.
-        """
-        return build_requires_shmem_decorator(
-            jit_func=jit_func,
-            find_device_library=RocshmemLibFinder.find_device_library,
-            extern_libs_key="rocshmem",
-            registry=RocshmemKernelRegistry,
-            init_hook=_rocshmem_init_hook,
-            error_prefix="@requires_rocshmem",
-        )
 
     # -----------------------------------------------------------------------
     # rocSHMEM device API — Triton-callable device functions.
@@ -173,16 +176,26 @@ if has_triton():
         """Put *nelems* elements from local *source* to *dest* on remote *pe*."""
         tl.static_assert(dest.type == source.type)
         nbytes = nelems * dest.type.element_ty.itemsize
-        return _putmem_wg(dest.to(tl.int64), source.to(tl.int64), nbytes.to(tl.int64), pe)
+        return _putmem_wg(
+            dest.to(tl.int64), source.to(tl.int64), nbytes.to(tl.int64), pe
+        )
 
     @core.extern
     def _putmem_wg(dest, source, size_bytes, pe, _semantic=None):  # type: ignore[no-untyped-def]
         return core.extern_elementwise(
-            "", "",
+            "",
+            "",
             [dest, source, size_bytes, pe],
-            {(core.dtype("int64"), core.dtype("int64"), core.dtype("int64"), core.dtype("int32")):
-             ("rocshmem_putmem_wg", core.dtype("int32"))},
-            is_pure=False, _semantic=_semantic,
+            {
+                (
+                    core.dtype("int64"),
+                    core.dtype("int64"),
+                    core.dtype("int64"),
+                    core.dtype("int32"),
+                ): ("rocshmem_putmem_wg", core.dtype("int32"))
+            },
+            is_pure=False,
+            _semantic=_semantic,
         )
 
     @triton.jit
@@ -190,16 +203,26 @@ if has_triton():
         """Get *nelems* elements from *source* on remote *pe* into local *dest* (blocking)."""
         tl.static_assert(dest.type == source.type)
         nbytes = nelems * dest.type.element_ty.itemsize
-        return _getmem_wg(dest.to(tl.int64), source.to(tl.int64), nbytes.to(tl.int64), pe)
+        return _getmem_wg(
+            dest.to(tl.int64), source.to(tl.int64), nbytes.to(tl.int64), pe
+        )
 
     @core.extern
     def _getmem_wg(dest, source, size_bytes, pe, _semantic=None):  # type: ignore[no-untyped-def]
         return core.extern_elementwise(
-            "", "",
+            "",
+            "",
             [dest, source, size_bytes, pe],
-            {(core.dtype("int64"), core.dtype("int64"), core.dtype("int64"), core.dtype("int32")):
-             ("rocshmem_getmem_wg", core.dtype("int32"))},
-            is_pure=False, _semantic=_semantic,
+            {
+                (
+                    core.dtype("int64"),
+                    core.dtype("int64"),
+                    core.dtype("int64"),
+                    core.dtype("int32"),
+                ): ("rocshmem_getmem_wg", core.dtype("int32"))
+            },
+            is_pure=False,
+            _semantic=_semantic,
         )
 
     @triton.jit
@@ -207,40 +230,78 @@ if has_triton():
         """Non-blocking get; call quiet() for completion."""
         tl.static_assert(dest.type == source.type)
         nbytes = nelems * dest.type.element_ty.itemsize
-        return _getmem_nbi_wg(dest.to(tl.int64), source.to(tl.int64), nbytes.to(tl.int64), pe)
+        return _getmem_nbi_wg(
+            dest.to(tl.int64), source.to(tl.int64), nbytes.to(tl.int64), pe
+        )
 
     @core.extern
     def _getmem_nbi_wg(dest, source, size_bytes, pe, _semantic=None):  # type: ignore[no-untyped-def]
         return core.extern_elementwise(
-            "", "",
+            "",
+            "",
             [dest, source, size_bytes, pe],
-            {(core.dtype("int64"), core.dtype("int64"), core.dtype("int64"), core.dtype("int32")):
-             ("rocshmem_getmem_nbi_wg", core.dtype("int32"))},
-            is_pure=False, _semantic=_semantic,
+            {
+                (
+                    core.dtype("int64"),
+                    core.dtype("int64"),
+                    core.dtype("int64"),
+                    core.dtype("int32"),
+                ): ("rocshmem_getmem_nbi_wg", core.dtype("int32"))
+            },
+            is_pure=False,
+            _semantic=_semantic,
         )
 
     @triton.jit
     def putmem_signal_block(  # type: ignore[no-untyped-def]
-        dst, src, size_bytes, signal, sig_val, sig_op, pe,
+        dst,
+        src,
+        size_bytes,
+        signal,
+        sig_val,
+        sig_op,
+        pe,
     ):
         """Put data to remote PE and atomically update a signal variable."""
         sig_val = 0 << 32 | sig_val
         return _putmem_signal_wg(
-            dst.to(tl.int64), src.to(tl.int64), size_bytes.to(tl.int64),
-            signal.to(tl.int64), sig_val.to(tl.uint64), sig_op, pe,
+            dst.to(tl.int64),
+            src.to(tl.int64),
+            size_bytes.to(tl.int64),
+            signal.to(tl.int64),
+            sig_val.to(tl.uint64),
+            sig_op,
+            pe,
         )
 
     @core.extern
     def _putmem_signal_wg(  # type: ignore[no-untyped-def]
-        dst, src, size_bytes, signal, sig_val, sig_op, pe, _semantic=None,
+        dst,
+        src,
+        size_bytes,
+        signal,
+        sig_val,
+        sig_op,
+        pe,
+        _semantic=None,
     ):
         return core.extern_elementwise(
-            "", "",
+            "",
+            "",
             [dst, src, size_bytes, signal, sig_val, sig_op, pe],
-            {(core.dtype("int64"), core.dtype("int64"), core.dtype("int64"),
-              core.dtype("int64"), core.dtype("uint64"), core.dtype("int32"), core.dtype("int32")):
-             ("rocshmem_putmem_signal_wg", core.dtype("int32"))},
-            is_pure=False, _semantic=_semantic,
+            {
+                (
+                    core.dtype("int64"),
+                    core.dtype("int64"),
+                    core.dtype("int64"),
+                    core.dtype("int64"),
+                    core.dtype("uint64"),
+                    core.dtype("int32"),
+                    core.dtype("int32"),
+                ): ("rocshmem_putmem_signal_wg", core.dtype("int32"))
+            },
+            is_pure=False,
+            _semantic=_semantic,
         )
 
     @triton.jit
@@ -255,11 +316,17 @@ if has_triton():
     @core.extern
     def _int_wait_until(ivar, cmp, cmp_val, _semantic=None):  # type: ignore[no-untyped-def]
         return core.extern_elementwise(
-            "", "",
+            "",
+            "",
             [ivar, cmp, cmp_val],
-            {(core.dtype("int64"), core.dtype("int32"), core.dtype("int32")):
-             ("rocshmem_int_wait_until", core.dtype("int32"))},
-            is_pure=False, _semantic=_semantic,
+            {
+                (core.dtype("int64"), core.dtype("int32"), core.dtype("int32")): (
+                    "rocshmem_int_wait_until",
+                    core.dtype("int32"),
+                )
+            },
+            is_pure=False,
+            _semantic=_semantic,
         )
 
     @triton.jit
@@ -271,11 +338,17 @@ if has_triton():
     @core.extern
     def _uint64_wait_until(signal, cmp, cmp_val, _semantic=None):  # type: ignore[no-untyped-def]
         return core.extern_elementwise(
-            "", "",
+            "",
+            "",
             [signal, cmp, cmp_val],
-            {(core.dtype("int64"), core.dtype("int32"), core.dtype("uint64")):
-             ("rocshmem_uint64_wait_until", core.dtype("int32"))},
-            is_pure=False, _semantic=_semantic,
+            {
+                (core.dtype("int64"), core.dtype("int32"), core.dtype("uint64")): (
+                    "rocshmem_uint64_wait_until",
+                    core.dtype("int32"),
+                )
+            },
+            is_pure=False,
+            _semantic=_semantic,
         )
 
     @triton.jit
@@ -291,54 +364,72 @@ if has_triton():
     def fence(_semantic=None):  # type: ignore[no-untyped-def]
         """Ensure ordering of issued remote-memory operations to each target PE."""
         return core.extern_elementwise(
-            "", "", [],
+            "",
+            "",
+            [],
             {(): ("rocshmem_fence", core.dtype("int32"))},
-            is_pure=False, _semantic=_semantic,
+            is_pure=False,
+            _semantic=_semantic,
         )
 
     @core.extern
     def quiet(_semantic=None):  # type: ignore[no-untyped-def]
         """Wait for completion of all outstanding remote-memory operations."""
         return core.extern_elementwise(
-            "", "", [],
+            "",
+            "",
+            [],
             {(): ("rocshmem_quiet", core.dtype("int32"))},
-            is_pure=False, _semantic=_semantic,
+            is_pure=False,
+            _semantic=_semantic,
         )
 
     @core.extern
     def my_pe(_semantic=None):  # type: ignore[no-untyped-def]
         """Return the PE number of the calling PE."""
         return core.extern_elementwise(
-            "", "", [],
+            "",
+            "",
+            [],
             {(): ("rocshmem_my_pe", core.dtype("int32"))},
-            is_pure=True, _semantic=_semantic,
+            is_pure=True,
+            _semantic=_semantic,
         )
 
     @core.extern
     def n_pes(_semantic=None):  # type: ignore[no-untyped-def]
         """Return the total number of PEs."""
         return core.extern_elementwise(
-            "", "", [],
+            "",
+            "",
+            [],
             {(): ("rocshmem_n_pes", core.dtype("int32"))},
-            is_pure=True, _semantic=_semantic,
+            is_pure=True,
+            _semantic=_semantic,
         )
 
     @core.extern
     def barrier_all(_semantic=None):  # type: ignore[no-untyped-def]
         """Barrier across all PEs with completion guarantee."""
         return core.extern_elementwise(
-            "", "", [],
+            "",
+            "",
+            [],
             {(): ("rocshmem_barrier_all", core.dtype("int32"))},
-            is_pure=False, _semantic=_semantic,
+            is_pure=False,
+            _semantic=_semantic,
         )
 
     @core.extern
     def sync_all(_semantic=None):  # type: ignore[no-untyped-def]
         """Lightweight synchronization barrier across all PEs."""
         return core.extern_elementwise(
-            "", "", [],
+            "",
+            "",
+            [],
             {(): ("rocshmem_sync_all", core.dtype("int32"))},
-            is_pure=False, _semantic=_semantic,
+            is_pure=False,
+            _semantic=_semantic,
         )
 
     # Collective stubs: rocSHMEM *_wg collectives are not exposed in current

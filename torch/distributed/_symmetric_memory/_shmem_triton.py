@@ -2,7 +2,7 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
-from torch.utils._triton import has_triton
+
 
 class ShmemKernelRegistry:
     _to_init: dict[str, Any] = {}
@@ -72,8 +72,24 @@ def requires_shmem(jit_func):  # type: ignore[no-untyped-def]
     return backend.requires_nvshmem(jit_func)
 
 
-if has_triton():
-    from triton.runtime.jit import JITFunction, KernelInterface
+def build_requires_shmem_decorator(  # type: ignore[no-untyped-def]
+    *,
+    jit_func,
+    find_device_library: Callable[[], str],
+    extern_libs_key: str,
+    registry: type[ShmemKernelRegistry],
+    init_hook: Callable[..., None],
+    error_prefix: str,
+):
+    try:
+        import triton
+        from triton.runtime.jit import JITFunction, KernelInterface
+    except Exception as e:
+        raise RuntimeError(
+            "Triton is required for symmetric-memory SHMEM device kernels. "
+            "Install a PyTorch build that includes Triton, or use a configuration "
+            "where torch.utils._triton.has_triton() is true."
+        ) from e
 
     class GridCallableWithExtern(KernelInterface):
         def __init__(self, jit_func: JITFunction, extern_libs: dict[str, str]) -> None:
@@ -83,26 +99,14 @@ if has_triton():
         def run(self, *args, **kwargs):  # type: ignore[no-untyped-def]
             return self.jit_func.run(*args, **kwargs, extern_libs=self.extern_libs)
 
-    def build_requires_shmem_decorator(  # type: ignore[no-untyped-def]
-        *,
-        jit_func,
-        find_device_library: Callable[[], str],
-        extern_libs_key: str,
-        registry: type[ShmemKernelRegistry],
-        init_hook: Callable[..., None],
-        error_prefix: str,
-    ):
-        import triton
-        from triton.runtime.jit import JITFunction
+    if not isinstance(jit_func, JITFunction):
+        raise TypeError(
+            f"{error_prefix} must be applied to a @triton.jit function, "
+            f"got {type(jit_func)}"
+        )
 
-        if not isinstance(jit_func, JITFunction):
-            raise TypeError(
-                f"{error_prefix} must be applied to a @triton.jit function, "
-                f"got {type(jit_func)}"
-            )
-
-        lib_path = find_device_library()
-        extern_libs = {extern_libs_key: lib_path}
-        registry.register(jit_func.fn.__name__)
-        triton.knobs.runtime.jit_post_compile_hook = init_hook
-        return GridCallableWithExtern(jit_func, extern_libs)
+    lib_path = find_device_library()
+    extern_libs = {extern_libs_key: lib_path}
+    registry.register(jit_func.fn.__name__)
+    triton.knobs.runtime.jit_post_compile_hook = init_hook
+    return GridCallableWithExtern(jit_func, extern_libs)
