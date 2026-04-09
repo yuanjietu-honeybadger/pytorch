@@ -410,24 +410,24 @@ if has_triton():
 
     @core.extern
     def barrier_all(_semantic=None):  # type: ignore[no-untyped-def]
-        """Barrier across all PEs with completion guarantee."""
+        """Barrier across all PEs with completion guarantee (workgroup-scoped)."""
         return core.extern_elementwise(
             "",
             "",
             [],
-            {(): ("rocshmem_barrier_all", core.dtype("int32"))},
+            {(): ("rocshmem_barrier_all_wg", core.dtype("int32"))},
             is_pure=False,
             _semantic=_semantic,
         )
 
     @core.extern
     def sync_all(_semantic=None):  # type: ignore[no-untyped-def]
-        """Lightweight synchronization barrier across all PEs."""
+        """Lightweight synchronization barrier across all PEs (workgroup-scoped)."""
         return core.extern_elementwise(
             "",
             "",
             [],
-            {(): ("rocshmem_sync_all", core.dtype("int32"))},
+            {(): ("rocshmem_sync_all_wg", core.dtype("int32"))},
             is_pure=False,
             _semantic=_semantic,
         )

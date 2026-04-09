@@ -27,6 +27,7 @@ from torch.testing._internal.common_utils import (
     parametrize,
     run_tests,
     skip_but_pass_in_sandcastle_if,
+    TEST_WITH_ROCM,
 )
 from torch.testing._internal.inductor_utils import IS_H100, requires_triton
 
@@ -274,8 +275,8 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
     #
     # For backend-specific tests:
     # - If few, add methods to SHMEMTritonTestBase with:
-    #     @unittest.skipIf(torch.version.hip is not None, "NVSHMEM-only")
-    #     @unittest.skipIf(torch.version.hip is None, "rocSHMEM-only")
+    #     @unittest.skipIf(TEST_WITH_ROCM, "NVSHMEM-only")
+    #     @unittest.skipIf(not TEST_WITH_ROCM, "rocSHMEM-only")
     # - If many, split into NVSHMEMTritonTest/ROCSHMEMTritonTest subclasses with class-level skips.
     # Start with decorated methods here; refactor if backend-only tests grow.
     __test__ = False
@@ -456,6 +457,8 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
         SIGNAL_VAL = 1  # Signal completion value
         NVSHMEM_CMP_EQ = 0  # compare equal for signal wait until
 
+        dist.barrier()
+
         if rank == 0:
             # Rank 0 puts into Rank 1
             my_putmem_signal_block_kernel[(1, 1, 1)](
@@ -483,11 +486,9 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
                 flag, torch.tensor([SIGNAL_VAL], dtype=torch.int64, device=self.device)
             )
 
+        dist.barrier()
+
     @requires_triton()
-    @unittest.skipIf(
-        torch.version.hip is not None,
-        "Known hang in rocSHMEM Triton put_signal_add path.",
-    )
     def test_triton_put_signal_add(self) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
@@ -511,9 +512,14 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
         flag = out_hdl.get_signal_pad(rank, (1,), dtype=torch.int64).fill_(0)
 
         peer = 1 - rank
-        NVSHMEM_SIGNAL_ADD = 5  # atomic add operation
+        # Backend-specific signal op values:
+        # - NVSHMEM uses 5 for SIGNAL_ADD
+        # - rocSHMEM enum ROCSHMEM_SIGNAL_ADD is 1
+        NVSHMEM_SIGNAL_ADD = 1 if TEST_WITH_ROCM else 5  # atomic add operation
         SIGNAL_VAL = 16  # val + NVSHMEM_SIGNAL_ADD
         NVSHMEM_CMP_EQ = 0
+
+        dist.barrier()
 
         if rank == 0:
             # Rank 0 puts into Rank 1
@@ -540,6 +546,8 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
                 flag, torch.tensor([SIGNAL_VAL], dtype=torch.int64, device=self.device)
             )
 
+        dist.barrier()
+
     @requires_triton()
     def test_triton_wait_until(self) -> None:
         torch.manual_seed(42 + self.rank)
@@ -561,6 +569,8 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
         expected_flag = torch.tensor(
             [FLAG_FINAL_VALUE], dtype=torch.int32, device=self.device
         )
+
+        dist.barrier()
 
         if rank == 0:
             # Rank 0 (the waiter)
@@ -585,6 +595,8 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
                 1,  # Number of elements
                 peer,  # The target PE (Rank 0)
             )
+
+        dist.barrier()
 
     @requires_triton()
     def test_triton_signal_wait_until(self) -> None:
@@ -615,6 +627,11 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
         flag_dtype = torch.int64
         flag = out_hdl.get_signal_pad(rank, (1,), dtype=flag_dtype).fill_(0)
 
+        # Keep all ranks aligned in MultiProcContinuousTest runs. This test's
+        # data path is rank-conditional (0/1 active), so without explicit
+        # synchronization non-participating ranks can race into later tests.
+        dist.barrier()
+
         if rank == 0:
             # Producer (rank 0): Puts data into rank 1's `out` buffer and then sets the flag
             my_putmem_signal_block_kernel[(1, 1, 1)](
@@ -643,6 +660,10 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
                     [COMPLETION_FLAG_VAL], dtype=flag_dtype, device=self.device
                 ),
             )
+
+        # Ensure no rank advances to the next test before the producer/consumer
+        # pair completes this test.
+        dist.barrier()
 
     @requires_triton()
     def test_triton_fence(self) -> None:
@@ -884,7 +905,7 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
 
     @requires_triton()
     @unittest.skipIf(
-        torch.version.hip is not None,
+        TEST_WITH_ROCM,
         "rocSHMEM *_wg collective symbols are unavailable in current device bitcode for this op.",
     )
     def test_triton_broadcast(self) -> None:
@@ -938,7 +959,7 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
 
     @requires_triton()
     @unittest.skipIf(
-        torch.version.hip is not None,
+        TEST_WITH_ROCM,
         "rocSHMEM *_wg collective symbols are unavailable in current device bitcode for this op.",
     )
     @parametrize(
@@ -1002,7 +1023,7 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
 
     @requires_triton()
     @unittest.skipIf(
-        torch.version.hip is not None,
+        TEST_WITH_ROCM,
         "rocSHMEM *_wg collective symbols are unavailable in current device bitcode for this op.",
     )
     @parametrize(
@@ -1089,7 +1110,7 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
 
     @requires_triton()
     @unittest.skipIf(
-        torch.version.hip is not None,
+        TEST_WITH_ROCM,
         "rocSHMEM *_wg collective symbols are unavailable in current device bitcode for this op.",
     )
     @parametrize(
@@ -1171,7 +1192,7 @@ class SHMEMTritonTest(ShmemTritonTestBase):
 
 
 SHMEMTritonTest = skip_but_pass_in_sandcastle_if(
-    torch.version.hip is None and not IS_H100,
+    (not TEST_WITH_ROCM) and not IS_H100,
     "NVSHMEM Triton tests require H100.",
 )(SHMEMTritonTest)
 
