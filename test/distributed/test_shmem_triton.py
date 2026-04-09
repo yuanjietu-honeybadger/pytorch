@@ -3,15 +3,19 @@
 # python test/distributed/test_shmem_triton.py
 
 import sys
-import unittest
 
 import torch
 import torch.distributed._symmetric_memory as symm_mem
+from torch.testing._internal.common_distributed import (
+    MultiProcContinuousTest,
+    PLATFORM_SUPPORTS_SYMM_MEM,
+    skip_if_rocm_multiprocess,
+)
 
 
 # Skip entire module if CUDA or SHMEM backend is not available before
 # importing SHMEM-specific modules.
-if not torch.backends.cuda.is_built() or not symm_mem.is_nvshmem_available():
+if not torch.backends.cuda.is_built() or not symm_mem.is_nvshmem_available() or not PLATFORM_SUPPORTS_SYMM_MEM:
     print("SHMEM backend (NVSHMEM/rocSHMEM) not available, skipping tests")
     sys.exit(0)
 
@@ -21,7 +25,7 @@ import triton.language as tl
 import torch.distributed as dist
 import torch.distributed._symmetric_memory._shmem_triton as shmem_triton
 from torch._inductor.runtime.triton_compat import triton
-from torch.testing._internal.common_distributed import MultiProcContinuousTest
+from torch.distributed._symmetric_memory._shmem_triton import requires_shmem
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
@@ -33,14 +37,22 @@ from torch.testing._internal.inductor_utils import IS_H100, requires_triton
 
 
 shmem_backend = shmem_triton.get_shmem_backend_module()
-requires_shmem = shmem_triton.requires_shmem
+
+
+
+def requires_h100():
+    return skip_but_pass_in_sandcastle_if(
+        (not TEST_WITH_ROCM) and not IS_H100,
+        "NVSHMEM Triton tests require H100.",
+    )
 
 # So that tests are written in device-agnostic way
 device_type = "cuda"
 device_module = torch.get_device_module(device_type)
 
-
 # Shared Triton JIT kernels
+
+
 @requires_shmem
 @triton.jit
 def my_put_kernel(
@@ -264,40 +276,20 @@ def my_reduce_kernel(
     shmem_backend.reduce(team_handle, dest_tensor, source_tensor, nreduce, operation)
 
 
-class ShmemTritonTestBase(MultiProcContinuousTest):
-    # """
-    # Abstract base class for SHMEM Triton tests.
-    #
-    # This class provides a unified base for SHMEM tests (NVSHMEM, rocSHMEM).
-    # Backend-specific skip policy is expressed with explicit decorators.
-    #
-    # SHMEMTritonTest is the single concrete test class that is collected.
-    #
-    # For backend-specific tests:
-    # - If few, add methods to SHMEMTritonTestBase with:
-    #     @unittest.skipIf(TEST_WITH_ROCM, "NVSHMEM-only")
-    #     @unittest.skipIf(not TEST_WITH_ROCM, "rocSHMEM-only")
-    # - If many, split into NVSHMEMTritonTest/ROCSHMEMTritonTest subclasses with class-level skips.
-    # Start with decorated methods here; refactor if backend-only tests grow.
-    __test__ = False
-    backend_name = "NVSHMEM"
-
-    def setUp(self) -> None:
-        super().setUp()
-        if self.__class__ is ShmemTritonTestBase:
-            self.skipTest("Abstract SHMEM base test class")
-
+@instantiate_parametrized_tests
+class SHMEMTritonTest(MultiProcContinuousTest):
     def _init_device(self) -> None:
         # TODO: relieve this (seems to hang if without)
         device_module.set_device(self.device)
         # Set NVSHMEM as SymmMem backend
-        symm_mem.set_backend(self.backend_name)
+        symm_mem.set_backend("NVSHMEM")
 
     @property
     def device(self) -> torch.device:
         return torch.device(device_type, self.rank)
 
     @requires_triton()
+    @requires_h100()
     def test_triton_put(self) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
@@ -347,7 +339,10 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
                 dst, torch.tensor(expected, device=self.device, dtype=dtype)
             )
 
-    def _run_triton_get(self, nbi: bool) -> None:
+    @requires_triton()
+    @requires_h100()
+    @parametrize("nbi", [False, True])  # Test both blocking and nonblocking interfaces
+    def test_triton_get(self, nbi: bool) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
 
@@ -369,7 +364,6 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
 
         dist.barrier()
         peer = 1 - rank
-
         if rank == 1:
             # Rank 1 gets data from rank 0 using tensor-aware API
             my_get_kernel[(1,)](
@@ -379,19 +373,21 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
                 peer,
                 nbi=nbi,
             )
-
         if rank == 1:
             torch.testing.assert_close(
                 out, val * torch.ones(numel, dtype=dtype, device=self.device)
             )
 
-    def _run_triton_get_ring(self) -> None:
+    @requires_triton()
+    @requires_h100()
+    def test_triton_get_ring(self) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
 
         group_name = dist.distributed_c10d._get_default_group().group_name
         rank = self.rank
         world_size = dist.get_world_size()
+
         # Configuration
         numel = 8
         dtype = torch.int8
@@ -403,9 +399,11 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
         symm_mem.rendezvous(out, group=group_name)
 
         dist.barrier()
+
         # Ring topology: each rank gets data from the rank to its left
         # rank 0 gets from rank (world_size-1), rank 1 gets from rank 0, etc.
         peer = (rank - 1) % world_size
+
         # All ranks execute the get operation using tensor-aware API
         my_get_kernel[(1,)](
             out,
@@ -421,15 +419,7 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
         )
 
     @requires_triton()
-    @parametrize("nbi", [False, True])
-    def test_triton_get(self, nbi: bool) -> None:
-        self._run_triton_get(nbi=nbi)
-
-    @requires_triton()
-    def test_triton_get_ring(self) -> None:
-        self._run_triton_get_ring()
-
-    @requires_triton()
+    @requires_h100()
     def test_triton_put_signal_set(self) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
@@ -456,8 +446,6 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
         NVSHMEM_SIGNAL_SET = 0  # value defined by NVSHMEM for atomic set
         SIGNAL_VAL = 1  # Signal completion value
         NVSHMEM_CMP_EQ = 0  # compare equal for signal wait until
-
-        dist.barrier()
 
         if rank == 0:
             # Rank 0 puts into Rank 1
@@ -486,9 +474,8 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
                 flag, torch.tensor([SIGNAL_VAL], dtype=torch.int64, device=self.device)
             )
 
-        dist.barrier()
-
     @requires_triton()
+    @requires_h100()
     def test_triton_put_signal_add(self) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
@@ -512,14 +499,11 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
         flag = out_hdl.get_signal_pad(rank, (1,), dtype=torch.int64).fill_(0)
 
         peer = 1 - rank
-        # Backend-specific signal op values:
-        # - NVSHMEM uses 5 for SIGNAL_ADD
-        # - rocSHMEM enum ROCSHMEM_SIGNAL_ADD is 1
-        NVSHMEM_SIGNAL_ADD = 1 if TEST_WITH_ROCM else 5  # atomic add operation
+        # NVSHMEM_SIGNAL_ADD = 5  (nvshmem_common.h)
+        # ROCSHMEM_SIGNAL_ADD = 1 (rocshmem_common.hpp enum ROCSHMEM_SIGNAL_OPS)
+        NVSHMEM_SIGNAL_ADD = 1 if TEST_WITH_ROCM else 5
         SIGNAL_VAL = 16  # val + NVSHMEM_SIGNAL_ADD
         NVSHMEM_CMP_EQ = 0
-
-        dist.barrier()
 
         if rank == 0:
             # Rank 0 puts into Rank 1
@@ -546,9 +530,8 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
                 flag, torch.tensor([SIGNAL_VAL], dtype=torch.int64, device=self.device)
             )
 
-        dist.barrier()
-
     @requires_triton()
+    @requires_h100()
     def test_triton_wait_until(self) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
@@ -569,8 +552,6 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
         expected_flag = torch.tensor(
             [FLAG_FINAL_VALUE], dtype=torch.int32, device=self.device
         )
-
-        dist.barrier()
 
         if rank == 0:
             # Rank 0 (the waiter)
@@ -596,9 +577,8 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
                 peer,  # The target PE (Rank 0)
             )
 
-        dist.barrier()
-
     @requires_triton()
+    @requires_h100()
     def test_triton_signal_wait_until(self) -> None:
         self._init_device()
         group_name = dist.distributed_c10d._get_default_group().group_name
@@ -626,11 +606,6 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
         # Use the signal pad for synchronization, as in previous tests
         flag_dtype = torch.int64
         flag = out_hdl.get_signal_pad(rank, (1,), dtype=flag_dtype).fill_(0)
-
-        # Keep all ranks aligned in MultiProcContinuousTest runs. This test's
-        # data path is rank-conditional (0/1 active), so without explicit
-        # synchronization non-participating ranks can race into later tests.
-        dist.barrier()
 
         if rank == 0:
             # Producer (rank 0): Puts data into rank 1's `out` buffer and then sets the flag
@@ -661,11 +636,8 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
                 ),
             )
 
-        # Ensure no rank advances to the next test before the producer/consumer
-        # pair completes this test.
-        dist.barrier()
-
     @requires_triton()
+    @requires_h100()
     def test_triton_fence(self) -> None:
         """
         Rank 0 performs two put operations into Rank 1's buffers with a fence
@@ -736,6 +708,7 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
             )
 
     @requires_triton()
+    @requires_h100()
     def test_triton_quiet(self) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
@@ -783,6 +756,7 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
         dist.barrier()
 
     @requires_triton()
+    @requires_h100()
     def test_triton_barrier(self) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
@@ -815,6 +789,7 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
             )
 
     @requires_triton()
+    @requires_h100()
     def test_triton_sync(self) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
@@ -855,11 +830,9 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
             torch.tensor([expected_remote], device=self.device, dtype=dtype),
         )
 
+    @skip_if_rocm_multiprocess
     @requires_triton()
-    @unittest.skipIf(
-        torch.version.hip is not None,
-        "rocSHMEM *_wg collective symbols are unavailable in current device bitcode for this op.",
-    )
+    @requires_h100()
     def test_triton_alltoall(self) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
@@ -903,11 +876,9 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
             actual = dst[i * nelems_per_pe : (i + 1) * nelems_per_pe]
             torch.testing.assert_close(actual, torch.full_like(actual, expected))
 
+    @skip_if_rocm_multiprocess
     @requires_triton()
-    @unittest.skipIf(
-        TEST_WITH_ROCM,
-        "rocSHMEM *_wg collective symbols are unavailable in current device bitcode for this op.",
-    )
+    @requires_h100()
     def test_triton_broadcast(self) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
@@ -937,6 +908,7 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
 
         # Synchronize before broadcast
         dist.barrier()
+
         # Execute broadcast
         team_handle = 0  # NVSHMEM_TEAM_WORLD
         my_broadcast_kernel[(1,)](
@@ -957,11 +929,9 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
             dst, torch.tensor(expected, device=self.device, dtype=dtype)
         )
 
+    @skip_if_rocm_multiprocess
     @requires_triton()
-    @unittest.skipIf(
-        TEST_WITH_ROCM,
-        "rocSHMEM *_wg collective symbols are unavailable in current device bitcode for this op.",
-    )
+    @requires_h100()
     @parametrize(
         "dtype",
         [
@@ -1021,11 +991,9 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
             dst, torch.tensor(expected, device=self.device, dtype=dtype)
         )
 
+    @skip_if_rocm_multiprocess
     @requires_triton()
-    @unittest.skipIf(
-        TEST_WITH_ROCM,
-        "rocSHMEM *_wg collective symbols are unavailable in current device bitcode for this op.",
-    )
+    @requires_h100()
     @parametrize(
         "dtype",
         [
@@ -1108,11 +1076,9 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
             dst_max, torch.tensor(expected_max, device=self.device, dtype=dtype)
         )
 
+    @skip_if_rocm_multiprocess
     @requires_triton()
-    @unittest.skipIf(
-        TEST_WITH_ROCM,
-        "rocSHMEM *_wg collective symbols are unavailable in current device bitcode for this op.",
-    )
+    @requires_h100()
     @parametrize(
         "dtype",
         [
@@ -1182,19 +1148,6 @@ class ShmemTritonTestBase(MultiProcContinuousTest):
         torch.testing.assert_close(
             dst, torch.tensor(expected, device=self.device, dtype=dtype)
         )
-
-
-instantiate_parametrized_tests(ShmemTritonTestBase)
-
-
-class SHMEMTritonTest(ShmemTritonTestBase):
-    __test__ = True
-
-
-SHMEMTritonTest = skip_but_pass_in_sandcastle_if(
-    (not TEST_WITH_ROCM) and not IS_H100,
-    "NVSHMEM Triton tests require H100.",
-)(SHMEMTritonTest)
 
 
 if __name__ == "__main__":

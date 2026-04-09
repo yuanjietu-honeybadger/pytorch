@@ -10,11 +10,9 @@ import logging
 import os
 import sysconfig
 
+from typing import Any
+
 import torch
-from torch.distributed._symmetric_memory._shmem_triton import (
-    run_shmem_init_hook,
-    ShmemKernelRegistry,
-)
 from torch.utils._triton import has_triton
 
 
@@ -89,8 +87,22 @@ class RocshmemLibFinder:
         return lib_path
 
 
-class RocshmemKernelRegistry(ShmemKernelRegistry):
+class RocshmemKernelRegistry:
     """Track Triton kernels that need rocSHMEM HIP-module initialization."""
+
+    _to_init: dict[str, Any] = {}
+
+    @classmethod
+    def register(cls, name: str) -> None:
+        cls._to_init.setdefault(name)
+
+    @classmethod
+    def deregister(cls, name: str) -> None:
+        cls._to_init.pop(name, None)
+
+    @classmethod
+    def has(cls, name: str) -> bool:
+        return name in cls._to_init
 
 
 def _rocshmem_init_hook(*args, **kwargs) -> None:  # type: ignore[no-untyped-def]
@@ -98,21 +110,43 @@ def _rocshmem_init_hook(*args, **kwargs) -> None:  # type: ignore[no-untyped-def
     Post-compile hook that initializes rocSHMEM device context in the
     compiled HIP module using the existing c10d NVSHMEM entrypoint.
     """
+    from torch._C._distributed_c10d import _nvshmemx_cumodule_init
 
-    try:
-        from torch._C._distributed_c10d import _nvshmemx_cumodule_init
-    except ImportError as e:
-        raise RuntimeError(
-            "rocSHMEM C++ extension not found. "
-            "PyTorch must be built with USE_ROCM=1 and rocSHMEM installed."
-        ) from e
+    jit_function = kwargs["fn"].jit_function
+    fn_name = jit_function.fn.__name__
 
-    run_shmem_init_hook(
-        kwargs=kwargs,
-        registry=RocshmemKernelRegistry,
-        module_init=_nvshmemx_cumodule_init,
-        logger=logger,
-    )
+    if RocshmemKernelRegistry.has(fn_name):
+        key = kwargs["key"]
+        device = kwargs["compile"]["device"]
+        kernel_cache = jit_function.device_caches[device][0]
+        kernel = kernel_cache.get(key, None)
+        if kernel is not None:
+            kernel.run  # noqa: B018
+            _nvshmemx_cumodule_init(kernel.module)
+        else:
+            logger.warning(
+                "It seems Triton hasn't created a kernel for function %s. "
+                "Please report this issue to Triton.",
+                fn_name,
+            )
+
+
+if has_triton():
+    from triton.runtime.jit import JITFunction, KernelInterface
+
+    class GridCallableWithExtern(KernelInterface):
+        """
+        KernelInterface invokes self.run in __getitem__, i.e. [].
+        We direct the call to JITFunction.run with extern_libs injected,
+        so that users don't have to pass it.
+        """
+
+        def __init__(self, jit_func: JITFunction, extern_libs: dict[str, str]) -> None:
+            self.jit_func = jit_func
+            self.extern_libs = extern_libs
+
+        def run(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            return self.jit_func.run(*args, **kwargs, extern_libs=self.extern_libs)
 
 
 def requires_rocshmem(  # type: ignore[no-untyped-def]
@@ -135,18 +169,22 @@ def requires_rocshmem(  # type: ignore[no-untyped-def]
 
     Set ``ROCSHMEM_LIB_DIR`` to override the default library search path.
     """
-    from torch.distributed._symmetric_memory._shmem_triton import (
-        build_requires_shmem_decorator,
-    )
+    import triton
+    from triton.runtime.jit import JITFunction
 
-    return build_requires_shmem_decorator(
-        jit_func=jit_func,
-        find_device_library=RocshmemLibFinder.find_device_library,
-        extern_libs_key="rocshmem",
-        registry=RocshmemKernelRegistry,
-        init_hook=_rocshmem_init_hook,
-        error_prefix="@requires_rocshmem",
-    )
+    if not isinstance(jit_func, JITFunction):
+        raise TypeError(
+            f"@requires_rocshmem must be applied to a @triton.jit function, "
+            f"got {type(jit_func)}"
+        )
+
+    lib_path = RocshmemLibFinder.find_device_library()
+    extern_libs = {"rocshmem": lib_path}
+
+    RocshmemKernelRegistry.register(jit_func.fn.__name__)
+    triton.knobs.runtime.jit_post_compile_hook = _rocshmem_init_hook
+
+    return GridCallableWithExtern(jit_func, extern_libs)
 
 
 if has_triton():
