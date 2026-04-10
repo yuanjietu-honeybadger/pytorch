@@ -15,7 +15,11 @@ from torch.testing._internal.common_distributed import (
 
 # Skip entire module if CUDA or SHMEM backend is not available before
 # importing SHMEM-specific modules.
-if not torch.backends.cuda.is_built() or not symm_mem.is_nvshmem_available() or not PLATFORM_SUPPORTS_SYMM_MEM:
+if (
+    not torch.backends.cuda.is_built()
+    or not symm_mem.is_nvshmem_available()
+    or not PLATFORM_SUPPORTS_SYMM_MEM
+):
     print("SHMEM backend (NVSHMEM/rocSHMEM) not available, skipping tests")
     sys.exit(0)
 
@@ -39,12 +43,12 @@ from torch.testing._internal.inductor_utils import IS_H100, requires_triton
 shmem_backend = shmem_triton.get_shmem_backend_module()
 
 
-
 def requires_h100():
     return skip_but_pass_in_sandcastle_if(
         (not TEST_WITH_ROCM) and not IS_H100,
         "NVSHMEM Triton tests require H100.",
     )
+
 
 # So that tests are written in device-agnostic way
 device_type = "cuda"

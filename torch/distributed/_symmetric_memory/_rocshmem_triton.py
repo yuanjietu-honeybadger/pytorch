@@ -13,8 +13,8 @@ from typing import Any
 
 import torch
 from torch.distributed._symmetric_memory._shmem_triton_utils import (
-    ShmemKernelRegistry,
     run_shmem_init_hook,
+    ShmemKernelRegistry,
 )
 from torch.utils._triton import has_triton
 
