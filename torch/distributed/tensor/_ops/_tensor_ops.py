@@ -282,7 +282,17 @@ def new_factory_strategy(op_schema: OpSchema) -> StrategyType:
             )
         )
 
-        if tuple(input_shape) == tuple(output_shape) and input_spec.is_sharded():
+        # Uninitialized factories (new_empty*) can safely inherit Partial
+        # placement since their contents will be overwritten immediately
+        # (e.g., by autograd's clone_obey_contract: new_empty_strided + copy_).
+        is_uninitialized_factory = op_schema.op in (
+            aten.new_empty.default,
+            aten.new_empty_strided.default,
+        )
+        can_propagate_placement = input_spec.is_sharded() or (
+            is_uninitialized_factory and not input_spec.is_replicated()
+        )
+        if tuple(input_shape) == tuple(output_shape) and can_propagate_placement:
             new_factory_strategy.strategies.append(
                 OpSpec(
                     output_specs=input_spec,

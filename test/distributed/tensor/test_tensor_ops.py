@@ -1748,6 +1748,58 @@ class TestNewEmptyStridedUneven(DTensorTestBase):
         )
 
     @with_comms
+    def test_backward_partial_grad_with_transpose(self):
+        """Backward preserves Partial placement when grad is non-contiguous (issue #180486).
+
+        When a Replicate DTensor parameter is used with to_local(grad_placements=[Partial()]),
+        and the backward produces a non-contiguous gradient (e.g. via transpose), autograd's
+        layout invariant calls new_empty_strided + copy_ to fix strides. This must preserve
+        the Partial placement rather than defaulting to Replicate.
+        """
+        mesh = self.build_device_mesh()
+
+        class _Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.randn(4, 8, 8))
+                self._grad_placement = None
+
+            def forward(self, x):
+                w = self.weight
+                if isinstance(w, DTensor):
+                    w = w.to_local(grad_placements=[Partial()])
+
+                    def _capture(param, model=self):
+                        if param.grad is not None and isinstance(param.grad, DTensor):
+                            model._grad_placement = param.grad.placements
+
+                    self.weight.register_post_accumulate_grad_hook(_capture)
+
+                # transpose backward produces non-contiguous grad
+                w = w.transpose(1, 2).contiguous()
+                return torch.mm(x, w[0])
+
+        model = _Model().to(self.device_type)
+        with torch.no_grad():
+            model.weight = torch.nn.Parameter(
+                DTensor.from_local(
+                    model.weight.data,
+                    device_mesh=mesh,
+                    placements=[Replicate()],
+                )
+            )
+
+        x = torch.randn(2, 8, device=self.device_type, requires_grad=True)
+        out = model(x)
+        out.sum().backward()
+
+        self.assertIsNotNone(model._grad_placement)
+        self.assertTrue(
+            all(isinstance(p, Partial) for p in model._grad_placement),
+            f"Expected Partial grad placement, got {model._grad_placement}",
+        )
+
+    @with_comms
     def test_backward_channels_last(self):
         """Backward preserves channels-last stride order for unevenly-sharded DTensor."""
         mesh = self.build_device_mesh()
