@@ -5,7 +5,7 @@ import contextlib
 import dataclasses
 import enum
 import functools
-import importlib
+import importlib.resources
 import inspect
 import io
 import itertools
@@ -80,7 +80,6 @@ from torch.fx.experimental.symbolic_shapes import (
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence, ValuesView
-    from pathlib import Path
 
     from torch import SymBool, SymFloat, SymInt
     from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND
@@ -4407,9 +4406,15 @@ def is_nonfreeable_buffers(dep: Dep) -> bool:
 
 
 # Make sure to also include your jinja templates within torch_package_data in setup.py, or this function won't be able to find them
-def load_template(name: str, template_dir: Path) -> str:
+def load_template(name: str, *, package: str, subdir: str = "templates") -> str:
     """Load a template file and return its content."""
-    with open(template_dir / f"{name}.py.jinja") as f:
+    try:
+        template_dir = importlib.resources.files(package) / subdir
+    except ModuleNotFoundError:
+        raise FileNotFoundError(
+            f"Template package {package}/{subdir} not found"
+        )
+    with (template_dir / f"{name}.py.jinja").open() as f:
         return f.read()
 
 
