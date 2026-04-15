@@ -3209,7 +3209,7 @@ class CommonTemplate:
             )
 
         self.common(fn, (torch.zeros(5, dtype=torch.int64),), check_lowp=False)
-    
+
     def test_arange8(self):
         def fn(x):
             # Create a small tensor with int64 values > INT32_MAX
