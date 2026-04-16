@@ -1800,9 +1800,91 @@ class CachingAutotuner(KernelInterface):
             and not autograd_profiler._is_profiler_enabled
             and len(self.launchers) == 1
         ):
-            self._fast_launcher = launcher
+            self._fast_launcher = self._build_fast_launcher(launcher) or launcher
 
         return result
+
+    def _build_fast_launcher(self, launcher: LauncherType) -> LauncherType | None:
+        """Try to build a _FastCudaLauncher-backed version of the launcher.
+
+        Returns a new launcher function with the runner replaced by a
+        _FastCudaLauncher instance (vectorcall C extension), or None if
+        conditions are not met.  Falls back silently on any error.
+        """
+        import types
+
+        if not self.inductor_meta.get(
+            "use_fast_triton_launcher",
+            torch._inductor.config.use_fast_triton_launcher,
+        ):
+            return None
+
+        try:
+            from torch._C import _FastCudaLauncher
+        except ImportError:
+            return None
+
+        try:
+            # Only works for the static triton launcher path.
+            if not getattr(launcher, "_is_static", False):
+                return None
+
+            runner = launcher.__globals__.get("runner")
+            if runner is None or not callable(runner):
+                return None
+
+            # runner is StaticallyLaunchedCudaKernel.run (bound method).
+            kernel = getattr(runner, "__self__", None)
+            if kernel is None:
+                return None
+
+            cu_function: int | None = getattr(kernel, "function", None)
+            if cu_function is None:
+                return None
+            num_warps: int = getattr(kernel, "num_warps", 0)
+            shared: int = getattr(kernel, "shared", 0)
+            arg_tys: str = getattr(kernel, "arg_tys", "")
+            if not arg_tys and not num_warps:
+                return None
+
+            n_scratch = 0
+            if getattr(kernel, "has_global_scratch", False):
+                n_scratch += 1
+            if getattr(kernel, "has_profile_scratch", False):
+                n_scratch += 1
+            # ROCm/HIP always passes two scratch-pointer args (global +
+            # profile) to match the HIP kernel ABI, even when neither
+            # scratch buffer is actually used.
+            if torch.version.hip:
+                n_scratch = max(n_scratch, 2)
+
+            fast_runner = _FastCudaLauncher(
+                cu_function, num_warps, shared, arg_tys, n_scratch
+            )
+
+            # Clone the launcher function with runner replaced.
+            new_globals = dict(launcher.__globals__)
+            new_globals["runner"] = fast_runner
+            new_launcher = types.FunctionType(
+                launcher.__code__,
+                new_globals,
+                launcher.__name__,
+            )
+            # Carry over attrs from the original launcher.
+            for attr in (
+                "config",
+                "n_regs",
+                "n_spills",
+                "shared",
+                "cache_hash",
+                "store_cubin",
+                "_is_static",
+            ):
+                if hasattr(launcher, attr):
+                    setattr(new_launcher, attr, getattr(launcher, attr))
+            return new_launcher
+        except Exception:
+            return None
 
     def _interpret_args_grid(
         self, args: tuple[Any, ...], cfg: Config
