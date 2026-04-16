@@ -1239,7 +1239,7 @@ class GraphModule(torch.nn.Module):
 
         synchronize_stream = torch.ops.streams.synchronize_stream(0);  synchronize_stream = None
         return (b,)
-""",  # noqa: B950
+""",
         )
 
         wrapper_body = _extract_wrapper_body(code)
@@ -1333,7 +1333,7 @@ class GraphModule(torch.nn.Module):
 
         synchronize_stream_2 = torch.ops.streams.synchronize_stream(2);  synchronize_stream_2 = None
         return (c,)
-""",  # noqa: B950
+""",
         )
 
         wrapper_body = _extract_wrapper_body(code)
@@ -1426,7 +1426,7 @@ class GraphModule(torch.nn.Module):
 
         synchronize_stream_1 = torch.ops.streams.synchronize_stream(1);  synchronize_stream_1 = None
         return (c,)
-""",  # noqa: B950
+""",
         )
 
         wrapper_body = _extract_wrapper_body(code)
