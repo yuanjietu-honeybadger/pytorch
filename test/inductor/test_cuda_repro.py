@@ -1560,11 +1560,32 @@ class CudaReproTests(TestCase):
 
         self.assertEqual(ref, res)
 
+    def test_explicit_precision_cast_not_elided(self):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed_all(0) if TEST_CUDA else torch.xpu.manual_seed_all(0)
+
+        for lowp_dtype in (torch.bfloat16, torch.float16):
+            with self.subTest(dtype=lowp_dtype):
+                x = torch.randn(4, 32, 32, device=device_type, dtype=torch.float32)
+                w = torch.randn(32, 32, device=device_type, dtype=torch.float32)
+
+                def fn(x, w):
+                    x = torch.matmul(x, w)
+                    x = x.to(lowp_dtype).float()
+                    x = x * torch.sigmoid(x)
+                    return x.sum(dim=1)
+
+                opt_fn = torch.compile(fn, backend="inductor", fullgraph=True)
+
+                expected = fn(x, w)
+                actual = opt_fn(x.clone(), w.clone())
+                self.assertEqual(expected, actual)
+
     @torch._inductor.config.patch(emulate_precision_casts=True)
     @torch._inductor.config.patch(pattern_matcher=False)
     def test_emulate_precision_casts_convert_element_type(self):
         torch.manual_seed(0)
-        torch.cuda.manual_seed_all(0)
+        torch.cuda.manual_seed_all(0) if TEST_CUDA else torch.xpu.manual_seed_all(0)
 
         x = torch.rand(1000, device=device_type, dtype=torch.float32)
 

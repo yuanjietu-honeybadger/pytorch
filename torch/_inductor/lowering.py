@@ -943,10 +943,10 @@ def _convert_element_type(x: TensorBox, dtype: torch.dtype):
             )(x, dtype)
     src_dtype = x.get_dtype()
     low_pr_fp = (torch.bfloat16, torch.float16)
-    use_compute_types = not (
-        config.emulate_precision_casts
-        and (src_dtype in low_pr_fp or dtype in low_pr_fp)
-    )
+    # Preserve explicit casts to/from fp16 and bf16 even when precision-cast
+    # emulation is disabled. This keeps round-trips like x.to(bf16).float()
+    # from being silently elided during fusion. See #179561.
+    use_compute_types = not (src_dtype in low_pr_fp or dtype in low_pr_fp)
     return to_dtype(x, dtype, copy=True, use_compute_types=use_compute_types)
 
 
