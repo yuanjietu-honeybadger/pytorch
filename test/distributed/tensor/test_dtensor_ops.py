@@ -1036,6 +1036,8 @@ class TestSingleDimStrategies(DTensorOpTestBase):
             # Stochastic: each shard gets independent RNG, so
             # op(full) != cat(op(shard0), op(shard1)).
             skip("exponential"),
+            skip("log_normal"),
+            skip("normal", "in_place"),
         },
     )
     def test_single_dim_strategy(self, dtype, op):
