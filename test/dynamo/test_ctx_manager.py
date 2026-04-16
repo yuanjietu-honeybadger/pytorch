@@ -20,6 +20,7 @@ from torch.testing._internal.common_cuda import PLATFORM_SUPPORTS_FLASH_ATTENTIO
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
+    skipIfXpu,
 )
 from torch.testing._internal.inductor_utils import HAS_GPU
 
@@ -935,6 +936,7 @@ class CtxManagerTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(out_32.device.type, "cpu")
         self.assertEqual(out_32.dtype, torch.float32)
 
+    @skipIfXpu("https://github.com/intel/torch-xpu-ops/issues/3359")
     @unittest.skipIf(not HAS_GPU, "requires GPU")
     def test_autocast_float64(self):
         class MyModule(torch.nn.Module):
