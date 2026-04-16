@@ -90,6 +90,20 @@ class TestGpuWrapper(InductorTestCase):
         result = compiled(x)
         self.assertEqual(result, x * 2)
 
+    def test_debug_sync_kernel(self):
+        if not RUN_GPU:
+            self.skipTest("GPU not available")
+
+        def test_fn(x):
+            return x * 2
+
+        compiled = torch.compile(
+            options={"cpp_wrapper": True, "triton.debug_sync_kernel": True}
+        )(test_fn)
+        x = torch.randn(8, device=self.device)
+        result = compiled(x)
+        self.assertEqual(result, x * 2)
+
     def test_non_tensor_args_wrapped_on_cpu(self):
         if not RUN_GPU:
             self.skipTest("GPU not available")
