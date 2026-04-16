@@ -814,6 +814,9 @@ class CppWrapperGpu(CppWrapperCpu):
         self.autotune_input_prefix = "_REAL_AUTOTUNE_INPUT"
         self._lazy_kernel_names: list[str] = []
 
+    def generate_debug_sync(self, buffer):
+        buffer.writeline("cudaDeviceSynchronize();")
+
     @staticmethod
     def create(
         is_subgraph: bool,
