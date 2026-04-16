@@ -394,12 +394,24 @@ class OverlapScheduler:
         bucket_mode: BucketMode | None = None,
         max_off_bucket_gb: float | None = 0.5,
         prioritize_bucketing_during_scheduling: bool = True,
+        pge_profile_path: str | None = None,
     ):
         self.gm = gm
         self.graph = gm.graph
         self.compute_overlap_multipler = compute_overlap_multipler
         self.max_node_distance = max_coll_distance
         self.max_in_flight_bytes: int = gb_to_bytes(max_in_flight_gb)
+
+        # Profile-guided estimation: create estimator from profile path
+        if pge_profile_path and custom_runtime_estimation is None:
+            from torch._inductor.fx_passes.profile_guided_estimation import (
+                ProfileGuidedEstimator,
+            )
+
+            custom_runtime_estimation = ProfileGuidedEstimator(
+                pge_profile_path, diagnostics_gm=gm
+            )
+
         self.custom_runtime_estimation = custom_runtime_estimation
         self.collective_bucketing = collective_bucketing
         self.insert_overlap_deps = insert_overlap_deps
@@ -1665,14 +1677,14 @@ def gather_node_runtime_estimations(
             compute_nodes.append(node)
             compute_analytical.append(est)
         elif node.op == "call_function" and node not in estimations:
+            est = None
             if custom_runtime_estimation is not None:
                 est = custom_runtime_estimation(node, None)
-                if est is not None:
-                    estimations[node] = est
-            else:
+            # Fall back to roofline if custom estimator returned None or absent
+            if est is None:
                 est = estimate_roofline_runtime_ms(node)
-                if est > 0:
-                    estimations[node] = est
+            if est is not None and est > 0:
+                estimations[node] = est
 
     # Fusion region costs (call_module nodes from collapse_fusion_regions)
     for node, region in fusion_region_of.items():
@@ -1755,6 +1767,7 @@ def schedule_overlap_bucketing(
     prioritize_bucketing_during_scheduling: bool = True,
     max_off_bucket_gb: float | None = 0.5,
     bucket_mode: BucketMode | None = None,
+    pge_profile_path: str | None = None,
 ) -> torch.fx.GraphModule:
     """Schedule nodes to maximize compute-collective overlap.
 
@@ -1814,6 +1827,7 @@ def schedule_overlap_bucketing(
         prioritize_bucketing_during_scheduling=prioritize_bucketing_during_scheduling,
         max_off_bucket_gb=max_off_bucket_gb,
         bucket_mode=bucket_mode,
+        pge_profile_path=pge_profile_path,
     ).run()
     trace_structured(
         "artifact",
@@ -1823,6 +1837,7 @@ def schedule_overlap_bucketing(
         },
         payload_fn=lambda: ret.print_readable(False),
     )
+
     return ret
 
 
@@ -1865,5 +1880,10 @@ def schedule_overlap_bucketing_from_inductor_configs(
     for key in config_keys:
         if (val := getattr(dist_opts, key, None)) is not None:
             kwargs[key] = val
+
+    # Profile-guided latency estimation
+    pge_path = dist_opts.profile_guided_estimations_profile_path
+    if pge_path and "custom_runtime_estimation" not in kwargs:
+        kwargs["pge_profile_path"] = pge_path
 
     return schedule_overlap_bucketing(gm, **kwargs)  # type: ignore[arg-type]
