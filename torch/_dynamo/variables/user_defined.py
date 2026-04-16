@@ -29,7 +29,6 @@ import dataclasses
 import enum
 import functools
 import inspect
-import itertools
 import random
 import sys
 import threading
@@ -45,6 +44,7 @@ import torch._dynamo.config
 import torch.nn
 from torch._guards import Source, TracingContext
 from torch.utils._python_dispatch import is_traceable_wrapper_subclass_type
+from torch.utils._pytree import GetAttrKey, is_structseq_class
 
 from .. import config, graph_break_hints, polyfills, variables
 from ..bytecode_transformation import create_call_function
@@ -64,7 +64,6 @@ from ..guards import GuardBuilder, install_guard
 from ..source import (
     AttrSource,
     CallFunctionNoArgsSource,
-    DataclassFieldsSource,
     DictGetItemSource,
     GetItemSource,
     RandomValueSource,
@@ -80,7 +79,6 @@ from ..utils import (
     frozenset_methods,
     get_custom_getattr,
     has_torch_function,
-    is_frozen_dataclass,
     is_lru_cache_wrapped_function,
     is_namedtuple_cls,
     is_wrapper_or_member_descriptor,
@@ -97,7 +95,9 @@ from ..utils import (
     unpatched_nn_module_getattr,
 )
 from .base import MutationType, NO_SUCH_SUBOBJ, ValueMutationNew, VariableTracker
-from .dicts import ConstDictVariable, DefaultDictVariable, SetVariable
+from .dicts import ConstDictVariable, DefaultDictVariable
+from .hashable import HashableTracker
+from .sets import SetVariable
 
 
 try:
@@ -278,14 +278,19 @@ class UserDefinedClassVariable(UserDefinedVariable):
             frozenset.__new__,
             tuple.__new__,
             list.__new__,
+            int.__new__,
+            float.__new__,
+            str.__new__,
         }
         return c_new_fns.union(exceptions)
 
     @staticmethod
     def is_supported_new_method(value: object) -> bool:
-        # TODO(anijain2305) - Extend this to support objects with default tp_new
-        # functions.
-        return value in UserDefinedClassVariable.supported_c_new_functions()
+        if value in UserDefinedClassVariable.supported_c_new_functions():
+            return True
+        # Structseq types each define their own C tp_new.
+        owner = getattr(value, "__self__", None)
+        return isinstance(owner, type) and is_structseq_class(owner)
 
     def can_constant_fold_through(self) -> bool:
         if self.value in self._constant_fold_classes():
@@ -307,6 +312,19 @@ class UserDefinedClassVariable(UserDefinedVariable):
             if name in base.__dict__:
                 return base.__dict__[name]
         return NO_SUCH_SUBOBJ
+
+    def bool_impl(
+        self,
+        tx: "InstructionTranslator",
+    ) -> "VariableTracker":
+        from .constant import CONSTANT_VARIABLE_TRUE
+
+        # bool() on a class consults the metaclass __bool__.
+        # If the metaclass is the default `type`, all classes are truthy.
+        metaclass = type(self.value)
+        if hasattr(metaclass, "__bool__") and metaclass is not type:
+            return self.call_method(tx, "__bool__", [], {})
+        return CONSTANT_VARIABLE_TRUE
 
     def var_getattr(self, tx: "InstructionTranslator", name: str) -> VariableTracker:
         source = AttrSource(self.source, name) if self.source is not None else None
@@ -370,7 +388,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
         # can't trace).  GetAttrVariable defers the access and lets
         # call_method handle it.
         if meta_attr is not NO_SUCH_SUBOBJ:
-            return variables.GetAttrVariable(self, name, None, source=source)
+            return variables.GetAttrVariable(self, name, type(meta_attr), source=source)
 
         # __getattr__ on metaclass (not part of type_getattro proper —
         # CPython handles this via slot_tp_getattr_hook).
@@ -417,7 +435,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
 
         if ConstantVariable.is_literal(resolved):
             return VariableTracker.build(tx, resolved)
-        return variables.GetAttrVariable(self, name, None, source=source)
+        return variables.GetAttrVariable(self, name, type(resolved), source=source)
 
     def resolve_cls_descriptor(
         self,
@@ -452,7 +470,9 @@ class UserDefinedClassVariable(UserDefinedVariable):
         if name in cmp_name_to_op_mapping and not isinstance(
             cls_attr, types.FunctionType
         ):
-            return variables.GetAttrVariable(self, name, None, source=source)
+            return variables.GetAttrVariable(
+                self, name, py_type=type(cls_attr), source=source
+            )
 
         # User-defined descriptor with Python __get__.
         # For torch-internal classes or attributes in the class's own __dict__,
@@ -486,7 +506,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
                 )
             ):
                 return VariableTracker.build(tx, cls_attr, source)
-            return variables.GetAttrVariable(self, name, None, source=source)
+            return variables.GetAttrVariable(self, name, type(cls_attr), source=source)
 
         # Everything else: FunctionType, etc.
         return VariableTracker.build(tx, cls_attr, source)
@@ -504,7 +524,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
         ):
             return super().var_getattr(tx, name)
         if self.value is collections.OrderedDict:
-            return variables.GetAttrVariable(self, name)
+            return variables.GetAttrVariable(self, name, py_type=type(cls_attr))
         return VariableTracker.build(tx, cls_attr, source)
 
     def invoke_cls_descriptor_get(
@@ -1000,9 +1020,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
                 kwargs,
             )
         elif is_namedtuple_cls(self.value):
-            fields = namedtuple_fields(self.value)  # type: ignore[arg-type]
-            # check if this a quasi-namedtuple or a real one
-            if self.value.__module__ == "torch.return_types":
+            if is_structseq_class(self.value):
                 if kwargs or len(args) != 1:
                     raise_args_mismatch(
                         tx,
@@ -1010,41 +1028,26 @@ class UserDefinedClassVariable(UserDefinedVariable):
                         "1 args and 0 kwargs",
                         f"{len(args)} args and {len(kwargs)} kwargs",
                     )
-                items = args[0].force_unpack_var_sequence(tx)
+                # Structseq tp_new is a C function, so we can't trace into
+                # it like namedtuples. Use track_new_user_defined_object
+                # directly with self as both base_cls_vt and cls_vt.
+                return tx.output.side_effects.track_new_user_defined_object(
+                    self,
+                    self,
+                    list(args),
+                )
             else:
-                field_defaults = self.value._field_defaults  # type: ignore[attr-defined]
-
-                items = list(args)
-                # pyrefly: ignore[bad-argument-type]
-                items.extend([None] * (len(fields) - len(items)))
-
-                var_tracker_kwargs: dict[str, VariableTracker] = {}
-                for field_name, var_tracker in zip(fields, items):
-                    if var_tracker is None:
-                        if field_name in kwargs:
-                            field_var = kwargs[field_name]
-                        else:
-                            assert field_name in field_defaults
-                            field_var = VariableTracker.build(
-                                tx, field_defaults[field_name]
-                            )
-                        var_tracker_kwargs[field_name] = field_var
-
-                for name, value in var_tracker_kwargs.items():
-                    assert name in fields
-                    items[fields.index(name)] = value  # type: ignore[call-overload]
-
-                assert all(x is not None for x in items)
-
-            # Modify mutability of namedtuple for sourcelesss instantiations.
-            from .base import AttributeMutationNew
-            from .lists import NamedTupleVariable
-
-            return NamedTupleVariable(
-                items,
-                self.value,  # type: ignore[arg-type]
-                mutation_type=AttributeMutationNew(),
-            )
+                # Namedtuple __new__ is a Python function that calls
+                # tuple.__new__(cls, (field_values,)). Let Dynamo trace
+                # into it so default values and kwargs are handled by
+                # the generated __new__ itself.
+                return tx.inline_user_function_return(
+                    VariableTracker.build(
+                        tx, polyfills.instantiate_user_defined_class_object
+                    ),
+                    [self, *args],
+                    kwargs,
+                )
         elif self.value is torch.Size:
             # This simulates `THPSize_pynew`, the C impl for `Size.__new__`.
             from .lists import SizeVariable
@@ -1061,49 +1064,6 @@ class UserDefinedClassVariable(UserDefinedVariable):
                 "because validation mutates the instance outside traced bytecode.",
                 hints=graph_break_hints.SUPPORTABLE,
             )
-        elif is_frozen_dataclass(self.value) and self.is_standard_new():
-            fields = dataclasses.fields(self.value)  # type: ignore[arg-type]
-            assert self.source is not None
-            fields_source = DataclassFieldsSource(self.source)
-            items = list(args)
-            items.extend([None] * (len(fields) - len(items)))  # type: ignore[arg-type]
-
-            default_kwargs = {}
-            for ind, field, var_tracker in zip(itertools.count(), fields, items):
-                if var_tracker is None:
-                    if field.name in kwargs:
-                        var_tracker = kwargs[field.name]
-                    else:
-                        if not field.init:
-                            continue
-
-                        if field.default is not dataclasses.MISSING:
-                            var_tracker = VariableTracker.build(
-                                tx,
-                                field.default,
-                                source=AttrSource(
-                                    GetItemSource(fields_source, ind), "default"
-                                ),
-                            )
-                        elif field.default_factory is not dataclasses.MISSING:
-                            factory_fn = VariableTracker.build(
-                                tx, field.default_factory
-                            )
-                            var_tracker = factory_fn.call_function(tx, [], {})
-                        else:
-                            # if we are subclass, the constructor could possibly
-                            # be missing args
-                            continue
-
-                    default_kwargs[field.name] = var_tracker
-            kwargs.update(default_kwargs)
-            var = tx.output.side_effects.track_new_user_defined_object(
-                SourcelessBuilder.create(tx, object),
-                self,
-                args,  # type: ignore[arg-type]
-            )
-            var.call_method(tx, "__init__", args, kwargs)  # type: ignore[arg-type]
-            return var
         elif (
             self.value in self._in_graph_classes()
             or is_traceable_wrapper_subclass_type(self.value)
@@ -1321,6 +1281,15 @@ class UserDefinedObjectVariable(UserDefinedVariable):
     Mostly objects of defined type.  Catch-all for something where we only know the type.
     """
 
+    # VT representing the base built-in type's data for subclassed built-in types
+    # (e.g., ConstDictVariable for dict subclasses, ListVariable for list subclasses).
+    # None for plain user-defined objects that don't subclass a built-in container.
+    _base_vt: VariableTracker | None = None
+
+    # Set of base class methods that can be delegated to _base_vt.
+    # Used to check whether a method is overridden before delegating.
+    _base_methods: set[Any] | None = None
+
     _nonvar_fields = {
         "value",
         "value_type",
@@ -1392,7 +1361,9 @@ class UserDefinedObjectVariable(UserDefinedVariable):
             self.dict_vt = variables.DunderDictVariable.create(tx, self)
         return self.dict_vt
 
-    def is_underlying_vt_modified(self, side_effects: "SideEffects") -> bool:
+    def is_base_vt_modified(self, side_effects: "SideEffects") -> bool:
+        if self._base_vt is not None:
+            return side_effects.is_modified(self._base_vt)
         return False
 
     def python_type(self) -> type:
@@ -1447,6 +1418,27 @@ class UserDefinedObjectVariable(UserDefinedVariable):
             return self.value
         return super().guard_as_python_constant()
 
+    def bool_impl(
+        self,
+        tx: "InstructionTranslator",
+    ) -> "VariableTracker | None":
+        # Mirrors slot_nb_bool:
+        # https://github.com/python/cpython/blob/c09ccd9c429/Objects/typeobject.c#L9408-L9458
+        if self._maybe_get_baseclass_method("__bool__"):
+            result = self.call_method(tx, "__bool__", [], {})
+            if result.is_python_constant():
+                result_value = result.as_python_constant()
+                if not isinstance(result_value, bool):
+                    raise_observed_exception(
+                        TypeError,
+                        tx,
+                        args=[
+                            f"__bool__ should return bool, returned {type(result_value).__name__}"
+                        ],
+                    )
+            return result
+        return None
+
     def nb_index_impl(
         self,
         tx: "InstructionTranslator",
@@ -1458,7 +1450,8 @@ class UserDefinedObjectVariable(UserDefinedVariable):
             return super().nb_index_impl(tx)
         method_var = self.resolve_type_attr(tx, "__index__", type_attr, source=None)
         result = method_var.call_function(tx, [], {})
-        # CPython validates that __index__ returns an int (abstract.c:1433-1438).
+        # CPython validates that __index__ returns an int.
+        # https://github.com/python/cpython/blob/c09ccd9c429/Objects/abstract.c#L1433-L1438
         if result.is_python_constant() and not isinstance(
             result.as_python_constant(), int
         ):
@@ -1575,6 +1568,14 @@ class UserDefinedObjectVariable(UserDefinedVariable):
                     hints=[*graph_break_hints.FUNDAMENTAL],
                 )
 
+            # Delegate to _base_vt for non-overridden base-class methods
+            if (
+                self._base_vt is not None
+                and self._base_methods is not None
+                and method in self._base_methods
+            ):
+                return self._base_vt.call_method(tx, name, args, kwargs)
+
             # check for methods implemented in C++
             if isinstance(method, types.FunctionType):
                 source = self.source
@@ -1619,9 +1620,21 @@ class UserDefinedObjectVariable(UserDefinedVariable):
         )
 
     def sq_length(self, tx: "InstructionTranslator") -> VariableTracker:
+        if (
+            self._base_vt is not None
+            and self._base_methods is not None
+            and self._maybe_get_baseclass_method("__len__") in self._base_methods
+        ):
+            return self._base_vt.sq_length(tx)
         return self.len_impl(tx)
 
     def mp_length(self, tx: "InstructionTranslator") -> VariableTracker:
+        if (
+            self._base_vt is not None
+            and self._base_methods is not None
+            and self._maybe_get_baseclass_method("__len__") in self._base_methods
+        ):
+            return self._base_vt.mp_length(tx)
         return self.len_impl(tx)
 
     def method_setattr_standard(
@@ -1736,6 +1749,10 @@ class UserDefinedObjectVariable(UserDefinedVariable):
         ) and not isinstance(self.value, threading.local)
 
     def unpack_var_sequence(self, tx: "InstructionTranslator") -> list[VariableTracker]:
+        if self._base_vt is not None and self._base_methods is not None:
+            iter_method = self._maybe_get_baseclass_method("__iter__")
+            if iter_method is not None and iter_method in self._base_methods:
+                return self._base_vt.unpack_var_sequence(tx)
         if (
             self.source
             and self._maybe_get_baseclass_method("__iter__") is list.__iter__
@@ -2298,6 +2315,9 @@ class UserDefinedObjectVariable(UserDefinedVariable):
         # MethodDescriptorType: e.g. list.append (PyMethodDef)
         # WrapperDescriptorType: e.g. list.__add__ (slot wrappers)
         # MethodWrapperType: e.g. [].__add__ (bound slot wrappers)
+        #
+        # Exception: if the descriptor has a registered polyfill, return the
+        # polyfill as a bound method so Dynamo can trace through it.
         if (
             isinstance(
                 type_attr,
@@ -2310,7 +2330,17 @@ class UserDefinedObjectVariable(UserDefinedVariable):
             or torch._C._dynamo.utils.is_instancemethod(type_attr)  # type: ignore[attr-defined]
             or is_cython_function(type_attr)
         ):
-            return variables.GetAttrVariable(self, name, None, source=source)
+            from .. import trace_rules
+
+            if trace_rules.is_polyfilled_callable(type_attr):  # type: ignore[arg-type]
+                from .functions import PolyfilledFunctionVariable
+
+                polyfill_handlers = PolyfilledFunctionVariable._get_polyfill_handlers()
+                wrapped: Any = polyfill_handlers.get(type_attr)  # type: ignore[arg-type]
+                if wrapped is not None:
+                    traceable_fn = wrapped.__torch_dynamo_polyfill__
+                    return variables.UserMethodVariable(traceable_fn, self)
+            return variables.GetAttrVariable(self, name, type(type_attr), source=source)
 
         # Plain class variable (or MethodType, C-level non-data descriptor
         # without __get__, etc.).
@@ -2383,10 +2413,13 @@ class UserDefinedObjectVariable(UserDefinedVariable):
 
     def is_python_hashable(self) -> bool:
         raise_on_overridden_hash(self.value, self)
+        if self._base_vt is not None:
+            return self._base_vt.is_python_hashable()
         return True
 
     def get_python_hash(self) -> int:
-        # default hash
+        if self._base_vt is not None:
+            return self._base_vt.get_python_hash()
         return hash(self.value)
 
     def is_python_equal(self, other: object) -> bool:
@@ -2578,36 +2611,20 @@ class UserDefinedObjectVariable(UserDefinedVariable):
 
 
 class FrozenDataClassVariable(UserDefinedObjectVariable):
-    @staticmethod
-    def create(
-        tx: "InstructionTranslator", value: object, source: Source
-    ) -> "FrozenDataClassVariable":
-        from dataclasses import fields
+    """Frozen dataclass variable for as_proxy/as_python_constant/hashability.
 
-        assert is_frozen_dataclass(value)
+    Construction is handled by the generic polyfill path (tracing through
+    the auto-generated __init__). Field values are retrieved dynamically
+    via var_getattr using InstructionTranslator.current_tx().
+    """
 
-        field_map = {}
-        for field in fields(value):  # type: ignore[arg-type]
-            if hasattr(value, field.name):
-                field_map[field.name] = VariableTracker.build(
-                    tx,
-                    getattr(value, field.name),
-                    source and AttrSource(source, field.name),
-                )
+    def _get_field_vt(self, field_name: str) -> VariableTracker:
+        from torch._dynamo.symbolic_convert import InstructionTranslator
 
-        return FrozenDataClassVariable(value, fields=field_map, source=source)
-
-    def __init__(
-        self, value: object, fields: dict[str, Any] | None = None, **kwargs: Any
-    ) -> None:
-        super().__init__(value, **kwargs)
-        if fields is None:
-            fields = {}
-        self.fields = fields
+        tx = InstructionTranslator.current_tx()
+        return self.var_getattr(tx, field_name)
 
     def as_python_constant(self) -> object:
-        # NOTE: this is an intentionally limited version of
-        # `as_python_constant` for `nonstrict_trace` implementation.
         from dataclasses import fields
 
         import torch.utils._pytree as pytree
@@ -2615,154 +2632,74 @@ class FrozenDataClassVariable(UserDefinedObjectVariable):
         if not istype(
             self.value, (pytree.TreeSpec, pytree.LeafSpec, pytree.ConstantNode)
         ):
-            # TODO loosen this restriction and fix `as_proxy`.
             raise NotImplementedError(
                 "currently can't reconstruct arbitrary frozen dataclass instances"
             )
 
-        # LeafSpec is deprecated, use treespec_leaf() instead
         if istype(self.value, pytree.LeafSpec):
             return pytree.treespec_leaf()
 
-        args = []
-        kwargs = {}
+        args: list[object] = []
+        kwargs: dict[str, object] = {}
         for field in fields(self.value):  # type: ignore[arg-type]
             if field.init:
-                data = self.fields[field.name].as_python_constant()
+                data = self._get_field_vt(field.name).as_python_constant()
                 if getattr(field, "kw_only", False):
                     kwargs[field.name] = data
                 else:
                     args.append(data)
 
-        # This is safe because we know the TreeSpec classes constructors don't
-        # have external side effects.
-        ctor = self.python_type()
-        return ctor(*args, **kwargs)
+        return self.python_type()(*args, **kwargs)
 
     def as_proxy(self) -> object:
         from dataclasses import fields
 
-        args = []
-        kwargs = {}
+        args: list[object] = []
+        kwargs: dict[str, object] = {}
         for field in fields(self.value):  # type: ignore[arg-type]
-            proxy = self.fields[field.name].as_proxy()
+            proxy = self._get_field_vt(field.name).as_proxy()
             if hasattr(field, "kw_only") and field.kw_only:
                 kwargs[field.name] = proxy
             else:
                 args.append(proxy)
 
-        # TODO this isn't really safe, because
-        # 1. it could invoke a user defined `__post_init__`.
-        # 2. it could invoke a user defined `__init__` if the class _subclasses_
-        #    a frozen dataclass.
-        # Either of the above could end up mutating external state.
-        ctor = self.python_type()
-        return ctor(*args, **kwargs)
+        return self.python_type()(*args, **kwargs)
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
-        from dataclasses import fields
-
-        # Handle specific pytree classes
-        import torch.utils._pytree as pytree
-
-        if isinstance(self.value, pytree.TreeSpec) and self.value.is_leaf():
-            # Create a new LeafSpec instance by calling the constructor
-            codegen.add_push_null(
-                lambda: codegen.load_import_from("torch.utils._pytree", "LeafSpec")
-            )
-            codegen.extend_output(create_call_function(0, False))
+        if self.source is not None:
+            codegen(self.source)
             return
-
-        # For general frozen dataclasses, reconstruct by calling the constructor
-        # with the field values as arguments
-        dataclass_cls = self.python_type()
-
-        if hasattr(dataclass_cls, "__post_init__"):
-            unimplemented(
-                gb_type="Frozen dataclass with __post_init__",
-                context=f"dataclass={dataclass_cls.__name__}",
-                explanation="Cannot reconstruct frozen dataclass with __post_init__ method, "
-                "as it may have side effects that would be incorrectly replayed.",
-                hints=[
-                    "Remove the __post_init__ method from the frozen dataclass.",
-                    *graph_break_hints.SUPPORTABLE,
-                ],
-            )
-
-        # Collect positional and keyword-only arguments
-        pos_args = []
-        # pyrefly: ignore [implicit-any]
-        kw_args = []
-        for field in fields(dataclass_cls):
-            if not field.init:
-                continue
-            field_vt = self.fields.get(field.name)
-            if field_vt is None:
-                unimplemented(
-                    gb_type="Frozen dataclass with missing field",
-                    context=f"dataclass={dataclass_cls.__name__}, field={field.name}",
-                    explanation=f"Cannot reconstruct frozen dataclass: field '{field.name}' "
-                    "was not tracked during tracing.",
-                    hints=[*graph_break_hints.SUPPORTABLE],
-                )
-            if getattr(field, "kw_only", False):
-                kw_args.append((field.name, field_vt))
-            else:
-                pos_args.append(field_vt)
-
-        # Load the dataclass constructor
-        codegen.add_push_null(
-            lambda: codegen.append_output(
-                codegen.create_load_const_unchecked(dataclass_cls)
-            )
+        codegen.append_output(
+            codegen.create_load_const_unchecked(self.as_python_constant())
         )
-        # Reconstruct all arguments
-        for arg_vt in pos_args:
-            codegen(arg_vt)
-        for _, arg_vt in kw_args:
-            codegen(arg_vt)
-        # Call the constructor
-        total_args = len(pos_args) + len(kw_args)
-        if kw_args:
-            kw_names = tuple(name for name, _ in kw_args)
-            codegen.extend_output(
-                codegen.create_call_function_kw(total_args, kw_names, push_null=False)
-            )
-        else:
-            codegen.extend_output(create_call_function(total_args, False))
-
-    # NB: This is called during __init__ for a frozen dataclass
-    # use this to accumulate the most up-to-date field values
-    def method_setattr_standard(
-        self,
-        tx: "InstructionTranslator",
-        name: VariableTracker,
-        value: VariableTracker,
-        directly_update_dict: bool = False,
-    ) -> VariableTracker:
-        self.fields[name.as_python_constant()] = value
-        return super().method_setattr_standard(tx, name, value, directly_update_dict)
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self.value_type.__name__})"
 
     def is_python_hashable(self) -> Literal[True]:
-        # TODO - Check corner cases like eq=False, hash=False etc
         return True
 
     def get_python_hash(self) -> int:
-        return hash(tuple(arg.get_python_hash() for arg in self.fields.values()))
+        from dataclasses import fields as dc_fields
+
+        return hash(
+            tuple(
+                self._get_field_vt(f.name).get_python_hash()
+                for f in dc_fields(self.value)  # type: ignore[arg-type]
+            )
+        )
 
     def is_python_equal(self, other: object) -> bool:
         if not isinstance(other, FrozenDataClassVariable):
             return False
-        is_class_same = self.python_type() is other.python_type()
-        is_field_name_same = self.fields.keys() == other.fields.keys()
-        is_field_value_same = all(
-            value_a.is_python_equal(value_b)
-            for value_a, value_b in zip(self.fields.values(), other.fields.values())
+        if self.python_type() is not other.python_type():
+            return False
+        from dataclasses import fields as dc_fields
+
+        return all(
+            self._get_field_vt(f.name).is_python_equal(other._get_field_vt(f.name))
+            for f in dc_fields(self.value)  # type: ignore[arg-type]
         )
-        return is_class_same and is_field_name_same and is_field_value_same
 
 
 class SourcelessGraphModuleVariable(UserDefinedObjectVariable):
@@ -2916,6 +2853,40 @@ class KeyedJaggedTensorVariable(UserDefinedObjectVariable):
         return super().var_getattr(tx, name)
 
 
+_CONSTANT_BASE_TYPES = (int, float, str)
+
+_constant_base_methods: dict[type, set[Any]] = {
+    t: {m for m in t.__dict__.values() if callable(m)} for t in _CONSTANT_BASE_TYPES
+}
+
+
+class UserDefinedConstantVariable(UserDefinedObjectVariable):
+    """
+    Represents user-defined objects that subclass immutable constant types
+    (int, float, str).
+
+    Uses a ConstantVariable as _base_vt for the underlying constant value.
+    """
+
+    def __init__(self, value: Any, **kwargs: Any) -> None:
+        from .constant import ConstantVariable
+
+        super().__init__(value, **kwargs)
+        for base in type(value).__mro__:
+            if base in _CONSTANT_BASE_TYPES:
+                self._base_vt = ConstantVariable.create(base(value))
+                self._base_methods = _constant_base_methods[base]
+                break
+        assert self._base_vt is not None
+
+    def as_python_constant(self) -> Any:
+        return self.value
+
+    def as_proxy(self) -> object:
+        assert self._base_vt is not None
+        return self._base_vt.as_proxy()
+
+
 class IntWrapperVariable(UserDefinedObjectVariable):
     # Dummy class to check if the object is an IntWrapper, and turn it into a
     # symint
@@ -2991,7 +2962,7 @@ class UserDefinedDictVariable(UserDefinedObjectVariable):
             assert self.source is None, (
                 "dict_vt must be constructed by builder.py when source is present"
             )
-            self._dict_vt = ConstDictVariable(
+            self._base_vt = ConstDictVariable(
                 {},
                 user_cls=(
                     collections.OrderedDict
@@ -3001,8 +2972,14 @@ class UserDefinedDictVariable(UserDefinedObjectVariable):
                 mutation_type=ValueMutationNew(),
             )
         else:
-            self._dict_vt = dict_vt
-        self._dict_methods = dict_methods
+            self._base_vt = dict_vt
+        self._base_methods = dict_methods
+        assert self._base_vt is not None
+
+    def sq_length(self, tx: "InstructionTranslator") -> VariableTracker:
+        # Dict implements __len__ via mp_length (mapping protocol), not
+        # sq_length (sequence protocol). Redirect so generic_len works.
+        return self.mp_length(tx)
 
     def call_method(
         self,
@@ -3011,63 +2988,21 @@ class UserDefinedDictVariable(UserDefinedObjectVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
-        method = self._maybe_get_baseclass_method(name)
-        if method in self._dict_methods:
-            # Dict subclasses can override __missing__ to provide fallback
-            # behavior instead of raising a KeyError. This is used, for example,
-            # by collections.Counter.
-            try:
-                return self._dict_vt.call_method(tx, name, args, kwargs)
-            except ObservedKeyError:
-                if (
-                    name == "__getitem__"
-                    and issubclass(self.python_type(), dict)
-                    and self._maybe_get_baseclass_method("__missing__")
-                ):
-                    return self.call_method(tx, "__missing__", args, kwargs)
-                else:
-                    raise
-        return super().call_method(tx, name, args, kwargs)
-
-    def unpack_var_sequence(self, tx: "InstructionTranslator") -> list[VariableTracker]:
-        if type(self.value).__iter__ in (  # type: ignore[attr-defined]
-            dict.__iter__,
-            collections.OrderedDict.__iter__,
+        # Dict subclasses can override __missing__ to provide fallback
+        # behavior instead of raising a KeyError. This is used, for example,
+        # by collections.Counter.
+        if (
+            name == "__getitem__"
+            and self._maybe_get_baseclass_method("__getitem__") in self._base_methods
+            and self._maybe_get_baseclass_method("__missing__")
         ):
-            return self._dict_vt.unpack_var_sequence(tx)
-        raise NotImplementedError
-
-    def is_underlying_vt_modified(self, side_effects: "SideEffects") -> bool:
-        return side_effects.is_modified(self._dict_vt)
-
-    @property
-    def user_cls(self) -> type[object]:
-        return self._dict_vt.user_cls
-
-    @property
-    def items(self) -> dict[VariableTracker, VariableTracker]:
-        return self._dict_vt.items
-
-    def install_dict_keys_match_guard(self) -> None:
-        return self._dict_vt.install_dict_keys_match_guard()
-
-    def install_dict_contains_guard(
-        self, tx: "InstructionTranslator", args: list[VariableTracker]
-    ) -> None:
-        return self._dict_vt.install_dict_contains_guard(tx, args)
-
-    def is_python_hashable(self) -> Literal[False]:
-        raise_on_overridden_hash(self.value, self)
-        return False
-
-    def mp_length(self, tx: "InstructionTranslator") -> VariableTracker:
-        if self._maybe_get_baseclass_method("__len__") in self._dict_methods:
-            return self._dict_vt.mp_length(tx)
-        return super().mp_length(tx)
-
-    def sq_length(self, tx: "InstructionTranslator") -> VariableTracker:
-        # User defined classes implements both sq_length and mp_length
-        return self.mp_length(tx)
+            assert self._base_vt is not None
+            try:
+                return self._base_vt.call_method(tx, name, args, kwargs)
+            except ObservedKeyError:
+                handle_observed_exception(tx)
+                return self.call_method(tx, "__missing__", args, kwargs)
+        return super().call_method(tx, name, args, kwargs)
 
 
 class UserDefinedSetVariable(UserDefinedObjectVariable):
@@ -3088,7 +3023,7 @@ class UserDefinedSetVariable(UserDefinedObjectVariable):
         super().__init__(value, **kwargs)
 
         python_type = set if isinstance(value, set) else frozenset
-        self._set_methods = set_methods if python_type is set else frozenset_methods
+        self._base_methods = set_methods if python_type is set else frozenset_methods
 
         if set_vt is None:
             assert self.source is None, (
@@ -3096,7 +3031,7 @@ class UserDefinedSetVariable(UserDefinedObjectVariable):
             )
             if python_type is set:
                 # set is initialized later
-                self._set_vt = variables.SetVariable(
+                self._base_vt = variables.SetVariable(
                     set(),
                     mutation_type=ValueMutationNew(),
                 )
@@ -3104,70 +3039,32 @@ class UserDefinedSetVariable(UserDefinedObjectVariable):
                 init_args = kwargs.get("init_args", {})
                 if tx is None:
                     tx = torch._dynamo.symbolic_convert.InstructionTranslator.current_tx()
-                self._set_vt = SourcelessBuilder.create(tx, python_type).call_function(  # type: ignore[assignment]
+                self._base_vt = SourcelessBuilder.create(tx, python_type).call_function(  # type: ignore[assignment]
                     tx, init_args, {}
                 )
         else:
-            self._set_vt = set_vt
-
-    def call_method(
-        self,
-        tx: "InstructionTranslator",
-        name: str,
-        args: list[VariableTracker],
-        kwargs: dict[str, VariableTracker],
-    ) -> VariableTracker:
-        method = self._maybe_get_baseclass_method(name)
-        if method in self._set_methods:
-            return self._set_vt.call_method(tx, name, args, kwargs)
-        return super().call_method(tx, name, args, kwargs)
+            self._base_vt = set_vt
+        assert self._base_vt is not None
 
     def as_python_constant(self) -> object:
-        return self._set_vt.as_python_constant()
-
-    def unpack_var_sequence(self, tx: "InstructionTranslator") -> list[VariableTracker]:
-        if inspect.getattr_static(self.value, "__iter__") in (
-            set.__iter__,
-            frozenset.__iter__,
-        ):
-            return self._set_vt.unpack_var_sequence(tx)
-        raise NotImplementedError
+        assert self._base_vt is not None
+        return self._base_vt.as_python_constant()
 
     @property
     def set_items(self) -> set[Any]:
-        return self._set_vt.set_items
+        assert self._base_vt is not None
+        return self._base_vt.set_items  # pyrefly: ignore[missing-attribute]
 
     @property
-    def items(self) -> list[VariableTracker]:
-        return self._set_vt.items
-
-    def sq_length(self, tx: "InstructionTranslator") -> VariableTracker:
-        if self._maybe_get_baseclass_method("__len__") in self._set_methods:
-            return self._set_vt.sq_length(tx)
-        return super().sq_length(tx)
-
-    def is_underlying_vt_modified(self, side_effects: "SideEffects") -> bool:
-        return side_effects.is_modified(self._set_vt)
-
-    def install_dict_keys_match_guard(self) -> None:
-        return self._set_vt.install_dict_keys_match_guard()
-
-    def install_dict_contains_guard(
-        self, tx: "InstructionTranslator", args: list[VariableTracker]
-    ) -> None:
-        return self._set_vt.install_dict_contains_guard(tx, args)
-
-    def is_python_hashable(self) -> bool:
-        raise_on_overridden_hash(self.value, self)
-        return self._set_vt.is_python_hashable()
-
-    def get_python_hash(self) -> int:
-        return self._set_vt.get_python_hash()
+    def items(self) -> dict[HashableTracker, VariableTracker]:
+        assert self._base_vt is not None
+        return self._base_vt.items  # pyrefly: ignore[missing-attribute]
 
     def is_python_equal(self, other: object) -> bool:
+        assert self._base_vt is not None
         return isinstance(
             other, UserDefinedSetVariable
-        ) and self._set_vt.is_python_equal(other._set_vt)
+        ) and self._base_vt.is_python_equal(other._base_vt)
 
 
 class UserDefinedListVariable(UserDefinedObjectVariable):
@@ -3189,41 +3086,11 @@ class UserDefinedListVariable(UserDefinedObjectVariable):
             assert self.source is None, (
                 "list_vt must be constructed by builder.py when source is present"
             )
-            self._list_vt = ListVariable([], mutation_type=ValueMutationNew())
+            self._base_vt = ListVariable([], mutation_type=ValueMutationNew())
         else:
-            self._list_vt = list_vt
-
-    def call_method(
-        self,
-        tx: "InstructionTranslator",
-        name: str,
-        args: list[VariableTracker],
-        kwargs: dict[str, VariableTracker],
-    ) -> VariableTracker:
-        assert self._list_vt is not None
-        method = self._maybe_get_baseclass_method(name)
-        if method in list_methods:
-            return self._list_vt.call_method(tx, name, args, kwargs)
-        return super().call_method(tx, name, args, kwargs)
-
-    def unpack_var_sequence(self, tx: "InstructionTranslator") -> list[VariableTracker]:
-        assert self._list_vt is not None
-        if type(self.value).__iter__ is list.__iter__:  # type: ignore[attr-defined]
-            return self._list_vt.unpack_var_sequence(tx)
-        raise NotImplementedError
-
-    def is_underlying_vt_modified(self, side_effects: "SideEffects") -> bool:
-        return side_effects.is_modified(self._list_vt)
-
-    def is_python_hashable(self) -> Literal[False]:
-        raise_on_overridden_hash(self.value, self)
-        return False
-
-    def sq_length(self, tx: "InstructionTranslator") -> VariableTracker:
-        assert self._list_vt is not None
-        if self._maybe_get_baseclass_method("__len__") in list_methods:
-            return self._list_vt.sq_length(tx)
-        return super().sq_length(tx)
+            self._base_vt = list_vt
+        self._base_methods = list_methods
+        assert self._base_vt is not None
 
 
 class UserDefinedTupleVariable(UserDefinedObjectVariable):
@@ -3233,9 +3100,21 @@ class UserDefinedTupleVariable(UserDefinedObjectVariable):
     Internally, it uses a TupleVariable to represent the tuple part of the
     variable tracker. For everything else, it falls back to
     UserDefinedObjectVariable.
+
+    NamedTupleVariable and StructSequenceVariable are subclasses that handle
+    namedtuples and structseqs (torch.return_types.*) respectively.
     """
 
-    _nonvar_fields = UserDefinedObjectVariable._nonvar_fields
+    _nonvar_fields = {
+        "tuple_cls",
+        *UserDefinedObjectVariable._nonvar_fields,
+    }
+
+    @staticmethod
+    def get_vt_cls(cls: type) -> type["UserDefinedTupleVariable"]:
+        if is_structseq_class(cls):
+            return StructSequenceVariable
+        return NamedTupleVariable
 
     def __init__(self, value, tuple_vt=None, init_args=None, **kwargs):  # type: ignore[all]
         from .lists import TupleVariable
@@ -3256,9 +3135,168 @@ class UserDefinedTupleVariable(UserDefinedObjectVariable):
 
                 tx = InstructionTranslator.current_tx()
             elems = init_args[0].force_unpack_var_sequence(tx)
-            self._tuple_vt = TupleVariable(elems, mutation_type=ValueMutationNew())
+            self._base_vt = TupleVariable(elems, mutation_type=ValueMutationNew())
         else:
-            self._tuple_vt = tuple_vt
+            self._base_vt = tuple_vt
+        self.tuple_cls = type(value)
+        self._base_methods = tuple_methods
+        assert self._base_vt is not None
+
+    @property
+    def items(self) -> list[VariableTracker]:
+        assert self._base_vt is not None
+        return self._base_vt.items  # type: ignore[return-value]
+
+    def call_method(
+        self,
+        tx: "InstructionTranslator",
+        name: str,
+        args: list[VariableTracker],
+        kwargs: dict[str, VariableTracker],
+    ) -> VariableTracker:
+        if name == "__eq__":
+            if len(args) != 1 or kwargs:
+                raise ValueError("Improper arguments for method.")
+            return VariableTracker.build(tx, self.is_python_equal(args[0]))
+        elif name == "__ne__":
+            if len(args) != 1 or kwargs:
+                raise ValueError("Improper arguments for method.")
+            return VariableTracker.build(tx, not self.is_python_equal(args[0]))
+        return super().call_method(tx, name, args, kwargs)
+
+    def reconstruct(self, codegen: "PyCodegen") -> None:
+        # Sourceless namedtuples/structseqs (e.g. tensor subclass metadata from
+        # SourcelessBuilder) aren't in id_to_variable so codegen_save_tempvars
+        # never processes them. When they appear in return values, codegen falls
+        # through to call_reconstruct. This is the same pattern as other
+        # sourceless containers (ConstDictVariable, TupleVariable, etc.).
+        # UserDefinedDictVariable doesn't need this because it's never created
+        # sourceless — it only comes from VariableBuilder which always has a
+        # source.
+        assert self.source is None
+        create_fn = self.get_construct_fn()
+        codegen.add_push_null(
+            lambda: codegen.append_output(
+                codegen.create_load_const_unchecked(create_fn)
+            )
+        )
+        codegen(self._base_vt)
+        codegen.extend_output(create_call_function(1, False))
+
+    def get_construct_fn(self) -> Callable[..., Any]:
+        raise NotImplementedError
+
+    def _validate_rest_for_tree_map(
+        self, rest: "collections.abc.Sequence[VariableTracker]"
+    ) -> list["UserDefinedTupleVariable"] | None:
+        """Validate that rest args are compatible for tree_map fast-path."""
+        others: list[UserDefinedTupleVariable] = []
+        n = len(self.items)
+        for candidate in rest:
+            if (
+                not isinstance(candidate, UserDefinedTupleVariable)
+                or len(candidate.items) != n
+                or candidate.tuple_cls is not self.tuple_cls
+            ):
+                return None
+            others.append(candidate)
+        return others
+
+    def _make_tree_map_result(
+        self, new_items: list[VariableTracker]
+    ) -> "UserDefinedTupleVariable":
+        from .lists import TupleVariable
+
+        tuple_vt = TupleVariable(new_items, mutation_type=ValueMutationNew())
+        return type(self)(
+            self.value,
+            tuple_vt=tuple_vt,
+            mutation_type=ValueMutationNew(),
+        )
+
+    def _is_pytree_node(self) -> bool:
+        from torch.utils._pytree import is_namedtuple_class
+
+        return is_namedtuple_class(self.tuple_cls) or is_structseq_class(self.tuple_cls)
+
+    def call_tree_map_branch(
+        self,
+        tx: "InstructionTranslator",
+        tree_map_fn: "variables.functions.UserFunctionVariable",
+        map_fn: "VariableTracker",
+        rest: "collections.abc.Sequence[VariableTracker]",
+        tree_map_kwargs: "dict[str, VariableTracker]",
+    ) -> "VariableTracker":
+        if not self._is_pytree_node():
+            return super().call_tree_map_branch(
+                tx, tree_map_fn, map_fn, rest, tree_map_kwargs
+            )
+        others = self._validate_rest_for_tree_map(rest)
+        if others is None:
+            return self._tree_map_fallback(
+                tx, tree_map_fn, map_fn, rest, tree_map_kwargs
+            )
+
+        new_items: list[VariableTracker] = []
+        for idx, item in enumerate(self.items):
+            sibling_leaves = [o.items[idx] for o in others]
+            new_items.append(
+                item.call_tree_map(
+                    tx, tree_map_fn, map_fn, sibling_leaves, tree_map_kwargs
+                )
+            )
+
+        return self._make_tree_map_result(new_items)
+
+    def call_tree_map_with_path_branch(
+        self,
+        tx: "InstructionTranslator",
+        tree_map_fn: "variables.functions.UserFunctionVariable",
+        map_fn: "VariableTracker",
+        rest: "collections.abc.Sequence[VariableTracker]",
+        tree_map_kwargs: "dict[str, VariableTracker]",
+        keypath: "tuple[Any, ...]",
+    ) -> "VariableTracker":
+        if not self._is_pytree_node():
+            return super().call_tree_map_with_path_branch(
+                tx, tree_map_fn, map_fn, rest, tree_map_kwargs, keypath
+            )
+        others = self._validate_rest_for_tree_map(rest)
+        if others is None:
+            return self._tree_map_with_path_fallback(
+                tx, tree_map_fn, map_fn, rest, tree_map_kwargs, keypath
+            )
+
+        fields = namedtuple_fields(self.tuple_cls)
+        new_items: list[VariableTracker] = []
+        for idx, item in enumerate(self.items):
+            sibling_leaves = [o.items[idx] for o in others]
+            child_keypath = keypath + (GetAttrKey(fields[idx]),)
+            new_items.append(
+                item.call_tree_map_with_path(
+                    tx,
+                    tree_map_fn,
+                    map_fn,
+                    sibling_leaves,
+                    tree_map_kwargs,
+                    child_keypath,
+                )
+            )
+
+        return self._make_tree_map_result(new_items)
+
+    def is_python_equal(self, other: object) -> bool:
+        assert self._base_vt is not None
+        other = other._base_vt if isinstance(other, UserDefinedTupleVariable) else other
+        return self._base_vt.is_python_equal(other)
+
+
+class NamedTupleVariable(UserDefinedTupleVariable):
+    """Represents Python namedtuples (created via collections.namedtuple).
+
+    Namedtuples use _tuplegetter descriptors for field access and
+    Type(*args) / Type._make(iterable) for construction.
+    """
 
     def resolve_data_descriptor(
         self,
@@ -3272,53 +3310,53 @@ class UserDefinedTupleVariable(UserDefinedObjectVariable):
             # We emulate _tuplegetter.__get__ by indexing into the tracked
             # tuple items, because self.value may not hold actual runtime values.
             _, (idx, _) = type_attr.__reduce__()
-            return self._tuple_vt.items[idx]  # type: ignore[union-attr]
+            return self.items[idx]  # type: ignore[union-attr]
         return super().resolve_data_descriptor(tx, name, type_attr, source)
 
-    def call_method(
+    def get_construct_fn(self) -> Callable[..., Any]:
+        return self.tuple_cls._make  # type: ignore[attr-defined]
+
+    def as_python_constant(self) -> Any:
+        items = [x.as_python_constant() for x in self.items]
+        return self.tuple_cls(*items)  # type: ignore[arg-type]
+
+    def as_proxy(self) -> Any:
+        items = [x.as_proxy() for x in self.items]
+        return self.tuple_cls(*items)  # type: ignore[arg-type]
+
+
+class StructSequenceVariable(UserDefinedTupleVariable):
+    """Represents C-implemented PyStructSequence types (torch.return_types.*).
+
+    Structseqs use Type(iterable) calling convention and reject tuple.__new__.
+    """
+
+    def resolve_data_descriptor(
         self,
         tx: "InstructionTranslator",
         name: str,
-        args: list[VariableTracker],
-        kwargs: dict[str, VariableTracker],
+        type_attr: object,
+        source: Source | None,
     ) -> VariableTracker:
-        assert self._tuple_vt is not None
-        if name == "__eq__":
-            if len(args) != 1 or kwargs:
-                raise ValueError("Improper arguments for method.")
-            return VariableTracker.build(tx, self.is_python_equal(args[0]))
-        elif name == "__ne__":
-            if len(args) != 1 or kwargs:
-                raise ValueError("Improper arguments for method.")
-            return VariableTracker.build(tx, not self.is_python_equal(args[0]))
-        method = self._maybe_get_baseclass_method(name)
-        if method in tuple_methods:
-            return self._tuple_vt.call_method(tx, name, args, kwargs)
-        return super().call_method(tx, name, args, kwargs)
+        if isinstance(type_attr, types.MemberDescriptorType):
+            # Structseq fields are member_descriptor objects. We emulate
+            # field access by looking up the field name in _fields and
+            # indexing into the tracked tuple items.
+            fields = namedtuple_fields(self.tuple_cls)
+            if name in fields:
+                return self.items[fields.index(name)]
+        return super().resolve_data_descriptor(tx, name, type_attr, source)
 
-    def unpack_var_sequence(self, tx: "InstructionTranslator") -> list[VariableTracker]:
-        assert self._tuple_vt is not None
-        if type(self.value).__iter__ is tuple.__iter__:  # type: ignore[attr-defined]
-            return self._tuple_vt.unpack_var_sequence(tx)
-        raise NotImplementedError
+    def get_construct_fn(self) -> Callable[..., Any]:
+        return self.tuple_cls
 
-    def is_python_hashable(self) -> bool:
-        raise_on_overridden_hash(self.value, self)
-        return self._tuple_vt.is_python_hashable()
+    def as_python_constant(self) -> Any:
+        items = [x.as_python_constant() for x in self.items]
+        return self.tuple_cls(items)
 
-    def sq_length(self, tx: "InstructionTranslator") -> VariableTracker:
-        if self._maybe_get_baseclass_method("__len__") in tuple_methods:
-            return self._tuple_vt.sq_length(tx)
-        return super().sq_length(tx)
-
-    def get_python_hash(self) -> int:
-        return self._tuple_vt.get_python_hash()
-
-    def is_python_equal(self, other: object) -> bool:
-        other = (
-            other._tuple_vt if isinstance(other, UserDefinedTupleVariable) else other
-        )
-        return self._tuple_vt.is_python_equal(other)
+    def as_proxy(self) -> Any:
+        items = [x.as_proxy() for x in self.items]
+        return self.tuple_cls(items)
 
 
 class MutableMappingVariable(UserDefinedObjectVariable):

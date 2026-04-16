@@ -20,6 +20,12 @@ from ._fsdp_common import (
 from ._fsdp_param import FSDPParam, ShardedState
 
 
+def _label_with_suffix(label: str, suffix: str) -> str:
+    if suffix:
+        return f"{label} {suffix}"
+    return label
+
+
 class AllGatherResult(NamedTuple):
     all_gather_output: torch.Tensor
     all_gather_event: torch.Event | None
@@ -330,43 +336,49 @@ def foreach_all_gather(
     all_gather_stream: torch.Stream,
     device: torch.device,
     all_gather_comm: AllGather,
+    label_suffix: str = "",
 ) -> AllGatherResult | None:
     world_size, rank = group.size(), group.rank()
     device_handle = _get_device_handle(device.type)
+
     with device_handle.stream(all_gather_copy_in_stream):
-        param_all_gather_inputs = _get_param_all_gather_inputs(fsdp_params)
-        (
-            param_all_gather_input_dtypes,
-            param_all_gather_input_numels,
-            dtype,
-        ) = _get_all_gather_input_metadatas(param_all_gather_inputs)
-        if dtype == torch.uint8:
-            all_gather_inputs = [
-                t.view(torch.uint8) for ts in param_all_gather_inputs for t in ts
-            ]
-        else:
-            all_gather_inputs = [*chain.from_iterable(param_all_gather_inputs)]
-        inp_split_sizes = [t.numel() for t in all_gather_inputs]
-        all_gather_input_numel = sum(inp_split_sizes)
-        all_gather_output = all_gather_comm.allocate(
-            (all_gather_input_numel * world_size,), dtype=dtype, device=device
-        )
-        all_gather_input, all_gather_output = torch.ops.fsdp.all_gather_copy_in(
-            all_gather_inputs,
-            all_gather_output,
-            inp_split_sizes,
-            all_gather_input_numel,
-            rank,
-        )
-        del param_all_gather_inputs
+        with torch.profiler.record_function(
+            _label_with_suffix("FSDP::all_gather_copy_in", label_suffix)
+        ):
+            param_all_gather_inputs = _get_param_all_gather_inputs(fsdp_params)
+            (
+                param_all_gather_input_dtypes,
+                param_all_gather_input_numels,
+                dtype,
+            ) = _get_all_gather_input_metadatas(param_all_gather_inputs)
+            if dtype == torch.uint8:
+                all_gather_inputs = [
+                    t.view(torch.uint8) for ts in param_all_gather_inputs for t in ts
+                ]
+            else:
+                all_gather_inputs = [*chain.from_iterable(param_all_gather_inputs)]
+            inp_split_sizes = [t.numel() for t in all_gather_inputs]
+            all_gather_input_numel = sum(inp_split_sizes)
+            all_gather_output = all_gather_comm.allocate(
+                (all_gather_input_numel * world_size,), dtype=dtype, device=device
+            )
+            all_gather_input, all_gather_output = torch.ops.fsdp.all_gather_copy_in(
+                all_gather_inputs,
+                all_gather_output,
+                inp_split_sizes,
+                all_gather_input_numel,
+                rank,
+            )
+            del param_all_gather_inputs
     all_gather_stream.wait_stream(all_gather_copy_in_stream)
     with device_handle.stream(all_gather_stream):
-        all_gather_work = all_gather_comm(
-            output_tensor=all_gather_output,
-            input_tensor=all_gather_input,
-            group=group,
-            async_op=async_op,
-        )
+        with dist.record_comm(_label_with_suffix("FSDP::all_gather", label_suffix)):
+            all_gather_work = all_gather_comm(
+                output_tensor=all_gather_output,
+                input_tensor=all_gather_input,
+                group=group,
+                async_op=async_op,
+            )
         all_gather_event = all_gather_stream.record_event()
         return AllGatherResult(
             all_gather_output,
@@ -537,6 +549,7 @@ def foreach_reduce(
     partial_reduce_output: torch.Tensor | None,  # only used for HSDP
     all_reduce_hook: Callable[[torch.Tensor], None] | None,
     force_sum_reduction_for_comms: bool = False,
+    label_suffix: str = "",
     prev_all_reduce_state: object | None = None,
 ) -> tuple[
     torch.Tensor,
@@ -618,12 +631,15 @@ def foreach_reduce(
         )
         _div_if_needed(reduce_scatter_input, predivide_factor)
         if world_size > 1:
-            reduce_scatter_comm(
-                output_tensor=reduce_output,
-                input_tensor=reduce_scatter_input,
-                group=reduce_scatter_group,
-                op=reduce_scatter_op,
-            )
+            with dist.record_comm(
+                _label_with_suffix("FSDP::reduce_scatter", label_suffix)
+            ):
+                reduce_scatter_comm(
+                    output_tensor=reduce_output,
+                    input_tensor=reduce_scatter_input,
+                    group=reduce_scatter_group,
+                    op=reduce_scatter_op,
+                )
         else:
             # For single GPU, just copy the input to output (no actual reduce-scatter needed), and
             # account for a possible gradient_divide_factor.
@@ -636,9 +652,6 @@ def foreach_reduce(
         if all_reduce_group is not None:  # HSDP or DDP/replicate
             # Accumulations must run in the reduce-scatter stream
             if not all_reduce_grads:
-                if prev_all_reduce_state is not None:
-                    with device_handle.stream(all_reduce_stream):
-                        del prev_all_reduce_state
                 if partial_reduce_output is not None:
                     partial_reduce_output += reduce_output
                 else:
@@ -659,12 +672,16 @@ def foreach_reduce(
             else:
                 all_reduce_stream.wait_stream(current_stream)
             with device_handle.stream(all_reduce_stream):
-                dist.all_reduce(
-                    reduce_output,
-                    group=all_reduce_group,
-                    op=all_reduce_op,
-                )
+                with dist.record_comm(
+                    _label_with_suffix("FSDP::all_reduce", label_suffix)
+                ):
+                    dist.all_reduce(
+                        reduce_output,
+                        group=all_reduce_group,
+                        op=all_reduce_op,
+                    )
                 all_reduce_input = reduce_output
+                all_reduce_event = all_reduce_stream.record_event()
     # -- END: ops in reduce_scatter stream
 
     if all_reduce_hook is not None:
@@ -677,24 +694,20 @@ def foreach_reduce(
             all_reduce_hook(reduce_output)
     # -- END: ops post reduce_scatter
 
+    if prev_all_reduce_state is not None:
+        prev_event = getattr(prev_all_reduce_state, "event", None)
+        if prev_event is not None:
+            all_reduce_stream.wait_event(prev_event)
+        with device_handle.stream(all_reduce_stream):
+            del prev_all_reduce_state
+
     with device_handle.stream(post_reduce_stream):
-        # Free previous layer's reduce-scatter output buffer on the AR
-        # stream. The AR stream is ordered, so the previous layer's
-        # all-reduce + div + dtype_cast are guaranteed complete here.
-        # Freeing on this stream (not the default stream) avoids blocking
-        # backward compute and preserves all-reduce pipelining.
-        del prev_all_reduce_state
         _div_if_needed(reduce_output, postdivide_factor)
         reduce_output = _to_dtype_if_needed(reduce_output, orig_dtype)
         if all_reduce_input is not None and reduce_output is not all_reduce_input:
-            # The dtype cast created a new tensor, so the original fp32
-            # all-reduce buffer has no refs from param grads. Keep it alive
-            # via all_reduce_input until the next layer frees it.
+            # The dtype cast created a new tensor, so the original higher-
+            # precision all-reduce buffer has no refs from param grads.
             all_reduce_event = post_reduce_stream.record_event()
-        else:
-            # No dtype cast (or no all-reduce): param grads already hold
-            # refs to the buffer, so no need to keep an extra reference.
-            all_reduce_input = None
         # View out and accumulate sharded gradients
         flat_grad_offset = 0  # [0, reduce_scatter_output_numel - 1]
         for padded_unsharded_size, fsdp_param in zip(

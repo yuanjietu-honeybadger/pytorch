@@ -96,7 +96,7 @@ class FSDPCommContext:
         # CUDA events for synchronization
         self.all_gather_state: AllGatherState | None = None
         self.reduce_scatter_states: list[ReduceScatterState] = []
-        self.all_reduce_state: AllReduceState | None = None
+        self.cast_all_reduce_state: AllReduceState | None = None
         # Post-forward order for explicit backward prefetching
         self.post_forward_order: list[FSDPParamGroup] = []  # will cause ref cycles
 
@@ -206,11 +206,6 @@ class FSDPParamGroup:
         # Optional custom factor for the gradient reduction op (e.g. to divide
         # by a factor other than the world size)
         self.gradient_divide_factor: float | None = None
-        # Whether to include zero gradients for parameters that did not
-        # receive a gradient in backward (e.g. due to conditional parameter
-        # usage across ranks). This ensures all ranks participate in the same
-        # reduce-scatter collectives, avoiding collective mismatch errors.
-        self.reduce_scatter_unused_params: bool = False
         # Whether reduce-scatter and all-reduce should be issued using only
         # summations, potentially with separate pre-/post-scaling.
         self.force_sum_reduction_for_comms: bool = False
@@ -236,8 +231,10 @@ class FSDPParamGroup:
         # Only for HSDP, if accumulating gradients without all-reduce, save the
         # partial reduce output (only reduce-scattered but not all-reduced)
         self._partial_reduce_output: torch.Tensor | None = None
-        # all-reduce state is stored on comm_ctx (shared across param groups)
-        # so each layer's backward frees the previous layer's buffer eagerly
+        # For the common no-cast path, keep the original per-param-group
+        # synchronization behavior. The shared comm_ctx state is only needed
+        # for the mixed-precision cast case.
+        self._all_reduce_state: AllReduceState | None = None
 
     # Initialization #
     def _init_mp_dtypes(self) -> None:
@@ -379,6 +376,7 @@ class FSDPParamGroup:
                 *self.comm_ctx.get_all_gather_streams(async_op, self._training_state),
                 self.device,
                 self._all_gather_comm,
+                self._label_suffix,
             )
 
     def wait_for_unshard(self):
@@ -536,7 +534,6 @@ class FSDPParamGroup:
             # access the unsharded parameters when their data is present
             fsdp_params_with_grad: list[FSDPParam] = []
             unsharded_grads: list[torch.Tensor] = []
-
             for fsdp_param in self.fsdp_params:
                 if not hasattr(fsdp_param, "_unsharded_param"):
                     continue
@@ -550,12 +547,6 @@ class FSDPParamGroup:
                     fsdp_params_with_grad.append(fsdp_param)
                     unsharded_grads.append(fsdp_param.unsharded_grad_data)
                     fsdp_param.unsharded_param.grad = None
-                elif (
-                    self.reduce_scatter_unused_params
-                    and fsdp_param.unsharded_param.requires_grad
-                ):
-                    fsdp_params_with_grad.append(fsdp_param)
-                    unsharded_grads.append(torch.zeros_like(fsdp_param.unsharded_param))
             if self.reshard_after_backward:
                 self.reshard()
         # Wait on prior module's RS states (assumes backward fires groups
@@ -590,8 +581,11 @@ class FSDPParamGroup:
                 all_reduce_stream = self.comm_ctx.all_reduce_stream
 
             self._wait_for_post_backward()
-            prev_all_reduce_state = self.comm_ctx.all_reduce_state
-            self.comm_ctx.all_reduce_state = None
+            effective_reduce_dtype = self._reduce_dtype or self._orig_dtype
+            prev_all_reduce_state = None
+            if self._orig_dtype != effective_reduce_dtype:
+                prev_all_reduce_state = self.comm_ctx.cast_all_reduce_state
+                self.comm_ctx.cast_all_reduce_state = None
             (
                 reduce_scatter_input,
                 reduce_scatter_event,
@@ -624,6 +618,7 @@ class FSDPParamGroup:
                 self._partial_reduce_output,
                 self._all_reduce_hook,
                 self.force_sum_reduction_for_comms,
+                self._label_suffix,
                 prev_all_reduce_state,
             )
             self.comm_ctx.reduce_scatter_states.append(
@@ -635,12 +630,15 @@ class FSDPParamGroup:
                         raise AssertionError(
                             "Expected all_reduce_event to be set for non-CPU device"
                         )
-                self.comm_ctx.all_reduce_state = AllReduceState(
-                    all_reduce_input, all_reduce_event
-                )
+                all_reduce_state = AllReduceState(all_reduce_input, all_reduce_event)
+                if self._orig_dtype != effective_reduce_dtype:
+                    self.comm_ctx.cast_all_reduce_state = all_reduce_state
+                else:
+                    self._all_reduce_state = all_reduce_state
 
     def finalize_backward(self):
         self._wait_for_post_backward()
+        self._flush_comm_ctx_cast_all_reduce_state()
         for fsdp_param in self.fsdp_params:
             if fsdp_param.grad_offload_event is not None:
                 fsdp_param.grad_offload_event.synchronize()
@@ -660,8 +658,22 @@ class FSDPParamGroup:
         if self._post_reduce_event is not None:
             self.device_handle.current_stream().wait_event(self._post_reduce_event)
             self._post_reduce_event = None
-        # all_reduce_state is freed on the AR stream inside foreach_reduce,
-        # not here, to avoid blocking the default stream.
+        if (
+            self._all_reduce_state is not None
+            and self._all_reduce_state.event is not None
+        ):
+            self.device_handle.current_stream().wait_event(self._all_reduce_state.event)
+        self._all_reduce_state = None
+
+    def _flush_comm_ctx_cast_all_reduce_state(self):
+        if (
+            self.comm_ctx.cast_all_reduce_state is not None
+            and self.comm_ctx.cast_all_reduce_state.event is not None
+        ):
+            self.device_handle.current_stream().wait_event(
+                self.comm_ctx.cast_all_reduce_state.event
+            )
+        self.comm_ctx.cast_all_reduce_state = None
 
     def _backward_prefetch(self) -> None:
         if self._training_state == TrainingState.PRE_BACKWARD:
@@ -846,11 +858,17 @@ class FSDPParamGroup:
             )
         return self.mesh_info.replicate_process_group
 
-    def _with_fqn(self, label: str) -> str:
-        if self._module_fqn:
-            label = f"{label} ({self._module_fqn})"
+    @property
+    def _label_suffix(self) -> str:
+        suffix = f"({self._module_fqn})" if self._module_fqn else ""
         if self._num_param_groups > 1 and isinstance(self.mesh_info, FSDPMeshInfo):
-            label = f"{label} [pg={self.mesh_info.shard_mesh_size}]"
+            suffix = f"{suffix} [pg={self.mesh_info.shard_mesh_size}]".lstrip()
+        return suffix
+
+    def _with_fqn(self, label: str) -> str:
+        suffix = self._label_suffix
+        if suffix:
+            return f"{label} {suffix}"
         return label
 
     def __repr__(self):

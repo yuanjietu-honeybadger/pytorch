@@ -50,6 +50,7 @@ from torch._inductor.utils import (
     output_node,
     set_tracing_context_output_strides,
 )
+from torch._opaque_base import OpaqueBase
 from torch.fx._graph_pickler import _node_metadata_key_filter_safe, _ops_filter_safe
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._python_dispatch import is_in_torch_dispatch_mode
@@ -482,6 +483,7 @@ class CompiledFxGraph(OutputCode):
 
     cudagraph_info: CudagraphCachedInfo | None
     partition_maps: list[GraphPartitionMap] | None
+    compile_region_name: str | None
     fx_kwargs: _CompileFxKwargs
     inputs_to_check: Sequence[int]
 
@@ -506,6 +508,7 @@ class CompiledFxGraph(OutputCode):
         cudagraphs: BoxedBool,
         example_inputs: Sequence[InputType],
         static_input_idxs: Sequence[int],
+        compile_region_name: str | None,
         fx_kwargs: _CompileFxKwargs,
         inputs_to_check: Sequence[int],
         runnable_graph_str: str,
@@ -614,7 +617,15 @@ class CompiledFxGraph(OutputCode):
                     (not complex_memory_overlap_inputs, "complex memory overlap"),
                     (
                         all(
-                            isinstance(t, (torch.Tensor, torch.SymInt, torch.Generator))
+                            isinstance(
+                                t,
+                                (
+                                    torch.Tensor,
+                                    torch.SymInt,
+                                    torch.Generator,
+                                    OpaqueBase,
+                                ),
+                            )
                             for t in example_inputs
                         ),
                         "non-Tensor inputs",
@@ -637,6 +648,7 @@ class CompiledFxGraph(OutputCode):
                 )
 
         self.cudagraph_info = cudagraph_info
+        self.compile_region_name = compile_region_name
         self.inputs_to_check = inputs_to_check
         self.fx_kwargs = fx_kwargs
 
@@ -798,12 +810,19 @@ class CompiledFxGraph(OutputCode):
             original_callable = self.current_callable
 
             inductor_callable = InductorCompiledCallable(
-                original_callable, self._original_gm
+                original_callable,
+                self._original_gm,
+                compile_region_name=self.compile_region_name,
             )
 
             def wrapped_callable(inputs):
                 if is_in_torch_dispatch_mode():
-                    return inductor_compiled_code(inductor_callable, inputs)
+                    kwargs = (
+                        {"name": self.compile_region_name}
+                        if self.compile_region_name is not None
+                        else {}
+                    )
+                    return inductor_compiled_code(inductor_callable, inputs, **kwargs)
                 else:
                     return original_callable(inputs)
 

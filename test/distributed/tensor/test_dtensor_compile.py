@@ -1577,17 +1577,16 @@ def forward(self, L_x_ : torch.Tensor, L_mesh_ : torch.distributed.device_mesh.D
         x2 = x2.to_local()
         self.assertTrue(isinstance(x2, AsyncCollectiveTensor))
         opt_fn(x2)
-        # The important part: we get a wait_tensor() in the graph.
-        # At runtime, the input to the graph is an AsyncCollectiveTensor,
-        # and inside the graph we need to issue a wait() to synchronize.
+        # ACTs are unwrapped before AOT autograd tracing in
+        # process_inputs, so the graph receives a plain tensor with
+        # no wait_tensor op.
         self.assertExpectedInline(
             str(fw_graph_cell[0]).strip(),
             """\
-def forward(self, primals_1):
-    wait_tensor = torch.ops._c10d_functional.wait_tensor.default(primals_1)
-    sin = torch.ops.aten.sin.default(wait_tensor)
+def forward(self, arg0_1):
+    sin = torch.ops.aten.sin.default(arg0_1);  arg0_1 = None
     sin_1 = torch.ops.aten.sin.default(sin);  sin = None
-    return (sin_1, primals_1, wait_tensor)""",
+    return (sin_1,)""",
         )
 
     @skipIfTorchDynamo()
@@ -2382,6 +2381,30 @@ class outer_fn(torch.nn.Module):
                     DeviceMesh,
                     "DeviceMesh should not appear as get_attr in the joint graph",
                 )
+
+    def test_compile_optimizer_grad_view_base_dim_mismatch(self):
+        # Regression test for https://github.com/pytorch/pytorch/issues/176667
+        # When param._local_tensor is a view of an N-D base but
+        # grad._local_tensor is a view of a 1-D base (as in FSDP2's flat
+        # gradient buffer), dynamo's meta tensor creation must not reuse the
+        # param's symbolic context for the grad.
+        mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
+
+        # param: view of 2D base (simulates FSDP2 reshard padding)
+        param_local = torch.randn(32, 256)[:16]
+        param = DTensor.from_local(param_local, mesh, [Replicate()], run_check=False)
+        param.requires_grad_(True)
+        param.retain_grad()
+
+        # grad: view of 1D base (simulates FSDP2 flat gradient buffer)
+        grad_local = torch.randn(16 * 256 + 1000)[: 16 * 256].view(16, 256)
+        param.grad = DTensor.from_local(
+            grad_local, mesh, [Replicate()], run_check=False
+        )
+
+        opt = torch.optim.Adam([param], lr=1e-3)
+        compiled_step = torch.compile(opt.step, backend="aot_eager")
+        compiled_step()
 
 
 @instantiate_parametrized_tests

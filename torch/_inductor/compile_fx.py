@@ -35,6 +35,7 @@ from torch._dynamo import (
     logging as dynamo_logging,
     utils as dynamo_utils,
 )
+from torch._dynamo.backends import common as dynamo_common
 from torch._dynamo.device_interface import get_interface_for_device
 from torch._dynamo.repro.after_aot import wrap_compiler_debug
 from torch._dynamo.utils import (
@@ -50,7 +51,7 @@ from torch._dynamo.utils import (
     lazy_format_graph_code,
     set_feature_use,
 )
-from torch._functorch import config as functorch_config
+from torch._functorch import aot_autograd, config as functorch_config
 from torch._functorch._aot_autograd.subclass_parametrization import (
     unwrap_tensor_subclass_parameters,
 )
@@ -104,7 +105,6 @@ from torch.fx.passes.fake_tensor_prop import FakeTensorProp
 from torch.monitor import _WaitCounter
 from torch.utils._ordered_set import OrderedSet
 
-from .._dynamo.backends.common import aot_autograd
 from .._dynamo.exc import ShortenTraceback, SkipFrame
 from ..fx._lazy_graph_module import _use_lazy_graph_module
 from ..fx.graph import _PyTreeCodeGen
@@ -779,6 +779,7 @@ class _CompileFxCallable(Protocol):
         self,
         gm: GraphModule,
         example_inputs: Sequence[InputType],
+        compile_region_name: str | None = None,
         **kwargs: Unpack[_CompileFxKwargs],
     ) -> OutputCode: ...
 
@@ -786,6 +787,7 @@ class _CompileFxCallable(Protocol):
 def compile_fx_inner(
     gm: GraphModule,
     example_inputs: Sequence[InputType],
+    compile_region_name: str | None = None,
     **kwargs: Unpack[_CompileFxKwargs],
 ) -> OutputCode:
     kwargs.setdefault("cudagraphs", None)
@@ -825,6 +827,7 @@ def compile_fx_inner(
         return wrap_compiler_debug(_compile_fx_inner, compiler_name="inductor")(
             gm,
             example_inputs,
+            compile_region_name=compile_region_name,
             **kwargs,
         )
 
@@ -833,6 +836,7 @@ def compile_fx_inner(
 def _compile_fx_inner(
     gm: GraphModule,
     example_inputs: Sequence[InputType],
+    compile_region_name: str | None = None,
     **graph_kwargs: Unpack[_CompileFxKwargs],
 ) -> OutputCode:
     """
@@ -891,6 +895,7 @@ def _compile_fx_inner(
         save_args_for_compile_fx_inner(
             gm,
             example_inputs,
+            compile_region_name=compile_region_name,
             **graph_kwargs,
         )
 
@@ -987,7 +992,11 @@ def _compile_fx_inner(
             TritonBundler.begin_compile()
             try:
                 mb_compiled_graph = fx_codegen_and_compile(
-                    gm, example_inputs, inputs_to_check, **graph_kwargs
+                    gm,
+                    example_inputs,
+                    inputs_to_check,
+                    compile_region_name=compile_region_name,
+                    **graph_kwargs,
                 )
                 assert mb_compiled_graph is not None
                 (
@@ -1019,7 +1028,11 @@ def _compile_fx_inner(
             )
             try:
                 mb_compiled_graph = fx_codegen_and_compile(
-                    gm, example_inputs, inputs_to_check, **graph_kwargs
+                    gm,
+                    example_inputs,
+                    inputs_to_check,
+                    compile_region_name=compile_region_name,
+                    **graph_kwargs,
                 )
             except Exception as e:
                 raise InductorError(e, currentframe()).with_traceback(
@@ -1034,7 +1047,11 @@ def _compile_fx_inner(
             TritonBundler.begin_compile()
             try:
                 mb_compiled_graph = fx_codegen_and_compile(
-                    gm, example_inputs, inputs_to_check, **graph_kwargs
+                    gm,
+                    example_inputs,
+                    inputs_to_check,
+                    compile_region_name=compile_region_name,
+                    **graph_kwargs,
                 )
                 assert mb_compiled_graph is not None
                 mb_compiled_graph._time_taken_ns = time.time_ns() - start_time
@@ -1079,6 +1096,8 @@ def _compile_fx_inner(
 
         assert mb_compiled_graph is not None
         compiled_graph = mb_compiled_graph
+        if isinstance(compiled_graph, CompiledFxGraph):
+            compiled_graph.compile_region_name = compile_region_name
 
         # Logging and observability: we log a single chromium event
         # and a tlparse log for every cache action.
@@ -1193,6 +1212,7 @@ class FxCompile(ABC):
 
     # Some stats for logging/debugging
     _compile_stats: dict[type[FxCompile], _FxCompileStat] = defaultdict(_FxCompileStat)
+    compile_region_name: str | None = None
 
     # TODO: We should probably eventually add some kind of async version of this
     # so we can kick off a compile and then go do other things - but we'll need
@@ -1738,6 +1758,7 @@ class _InProcessFxCompile(FxCompile):
                         cudagraphs,
                         example_inputs,
                         static_input_idxs,
+                        self.compile_region_name,
                         graph_kwargs,
                         inputs_to_check,
                         runnable_graph_str,
@@ -1754,6 +1775,7 @@ def fx_codegen_and_compile(
     # This is derivable from the other inputs to this function, but we pass it
     # in explicitly because it's nontrivial to compute
     inputs_to_check: Sequence[int],
+    compile_region_name: str | None = None,
     **graph_kwargs: Unpack[_CompileFxKwargs],
 ) -> OutputCode:
     scheme: FxCompile
@@ -1779,6 +1801,9 @@ def fx_codegen_and_compile(
         )
         # pyrefly: ignore [unbound-name]
         scheme = _AsyncFxCompile(scheme)
+        scheme._compile.compile_region_name = (
+            compile_region_name  # pyrefly: ignore[attr-defined]
+        )
 
     if fx_compile_progressive:
         from .compile_fx_async import _ProgressiveFxCompile
@@ -1793,9 +1818,15 @@ def fx_codegen_and_compile(
 
         # Use in-process compile for the fast version
         fast_scheme = _InProcessFxCompile()
+        fast_scheme.compile_region_name = compile_region_name
 
         # pyrefly: ignore [unbound-name]
         scheme = _ProgressiveFxCompile(fast_scheme, scheme, progression_configs)
+        scheme._optimized_compile.compile_region_name = (
+            compile_region_name  # pyrefly: ignore[attr-defined]
+        )
+
+    scheme.compile_region_name = compile_region_name  # pyrefly: ignore[unbound-name]
 
     # pyrefly: ignore [unbound-name]
     return scheme.codegen_and_compile(gm, example_inputs, inputs_to_check, graph_kwargs)
@@ -2072,6 +2103,7 @@ def fw_compiler_freezing(
     dynamo_model: GraphModule,
     num_example_inputs: int,
     inner_compile: Callable[..., Any],
+    # TODO: Take compiler_config_extra instead
     cudagraphs: BoxedBool,
     graph_id: int,
     forward_device: BoxedDeviceIndex,
@@ -2173,9 +2205,11 @@ def fw_compiler_freezing(
 
 
 def get_cpp_wrapper_config() -> dict[str, object]:
-    if config.triton.cudagraphs:
+    if config.triton.cudagraphs and config.graph_partition:
         log_cudagraph_skip_and_bump_counter(
-            format_default_skip_message("cpp wrapper enabled")
+            format_default_skip_message(
+                "cpp-wrapper does not support graph partition yet"
+            )
         )
 
     autotune_at_compile_time = (
@@ -2187,7 +2221,11 @@ def get_cpp_wrapper_config() -> dict[str, object]:
     return {
         "triton.autotune_at_compile_time": autotune_at_compile_time,
         "triton.autotune_cublasLt": not autotune_at_compile_time,
-        "triton.cudagraphs": False,  # TODO: to be removed
+        "triton.cudagraphs": (
+            config.triton.cudagraphs
+            and not V.aot_compilation
+            and not config.graph_partition
+        ),
         "triton.store_cubin": True,
     }
 
@@ -2599,6 +2637,7 @@ def compile_fx(
     config_patches: dict[str, Any] | None = None,
     decompositions: dict[OpOverload, Callable[..., Any]] | None = None,
     ignore_shape_env: bool = False,
+    compile_region_name: str | None = None,
 ) -> CompileFxOutput:
     """
     Main entry point for compiling given FX graph.  Despite the fact that this
@@ -2636,7 +2675,14 @@ def compile_fx(
                 inner_compile=config.patch(config_patches)(inner_compile),
                 decompositions=decompositions,
                 ignore_shape_env=ignore_shape_env,
+                compile_region_name=compile_region_name,
             )
+
+    # Keep region names out of graph_kwargs so they don't perturb FX cache keys.
+    inner_compile = functools.partial(
+        inner_compile,
+        compile_region_name=compile_region_name,
+    )
 
     # Wake up the AsyncCompile subproc pool as early as possible (if there's cuda).
     if any(
@@ -2678,6 +2724,7 @@ def compile_fx(
                     ),
                     ignore_shape_env=ignore_shape_env,
                     get_decomp_fn=get_decomp_fn,
+                    compile_region_name=compile_region_name,
                 )
 
     return _maybe_wrap_and_compile_fx_main(
@@ -2686,6 +2733,7 @@ def compile_fx(
         inner_compile,
         ignore_shape_env,
         get_decomp_fn=get_decomp_fn,
+        compile_region_name=compile_region_name,
     )
 
 
@@ -2727,6 +2775,7 @@ def _maybe_wrap_and_compile_fx_main(
     ignore_shape_env: bool,
     *,
     get_decomp_fn: Callable[..., dict[Any, Callable[..., Any]]] = select_decomp_table,
+    compile_region_name: str | None = None,
 ) -> CompileFxOutput:
     """
     Part of compile_fx, called after patching configs.
@@ -2742,6 +2791,7 @@ def _maybe_wrap_and_compile_fx_main(
         inner_compile=inner_compile,
         ignore_shape_env=ignore_shape_env,
         get_decomp_fn=get_decomp_fn,
+        compile_region_name=compile_region_name,
     )
     if not graph_returns_tuple(model_):
         return make_graph_return_tuple(model_, example_inputs_, compile_gm)
@@ -2764,6 +2814,7 @@ def _maybe_wrap_and_compile_fx_main(
         inner_compile,
         ignore_shape_env,
         get_decomp_fn=get_decomp_fn,
+        compile_region_name=compile_region_name,
     )
 
 
@@ -2774,6 +2825,7 @@ def _compile_fx_main(
     ignore_shape_env: bool,
     *,
     get_decomp_fn: Callable[..., dict[Any, Callable[..., Any]]] = select_decomp_table,
+    compile_region_name: str | None = None,
 ) -> CompileFxOutput:
     """
     Main part of compile_fx, called after wrapping is done.
@@ -2954,17 +3006,17 @@ def _compile_fx_main(
             ),
         ):
             try:
-                return aot_autograd(
+                return dynamo_common.aot_autograd(
                     fw_compiler=fw_compiler,
                     bw_compiler=bw_compiler,
                     inference_compiler=inference_compiler,
                     decompositions=decompositions,
                     partition_fn=partition_fn,
                     keep_inference_input_mutations=True,
-                    cudagraphs=compiler_config_extra.cudagraphs,
-                    boxed_forward_device_index=compiler_config_extra.forward_device,
+                    compiler_config_extra=compiler_config_extra,
                     ignore_shape_env=ignore_shape_env,
                     pre_grad_passes=run_pre_grad_passes,
+                    compile_region_name=compile_region_name,
                 )(model_, example_inputs_)
             except ShortenTraceback as e:
                 # We will also shorten the traceback inside dynamo.
@@ -3153,3 +3205,73 @@ def _aoti_flatten_inputs(
         }
     )
     return flat_example_inputs, options
+
+
+def autograd_cache_key(
+    graph,
+    example_inputs,
+    ignore_shape_env: bool,
+    decompositions=None,
+):
+    if config.cpp_wrapper or config.fx_wrapper:
+        raise RuntimeError(
+            "autograd_cache_key is not supported with cpp_wrapper or fx_wrapper"
+        )
+
+    decompositions = (
+        decompositions if decompositions is not None else select_decomp_table()
+    )
+    # compile_fx applies these graph transforms before reaching _compile_fx_main.
+    # Neither occurs on the torch.compile/Dynamo path (which always produces
+    # tuple-returning, pre-flattened graphs). Not supported by this API.
+    if isinstance(graph, GraphModule) and not graph_returns_tuple(graph):
+        raise NotImplementedError(
+            "autograd_cache_key does not support graphs that don't return a tuple"
+        )
+    if any(isinstance(x, (list, tuple, dict)) for x in example_inputs):
+        raise NotImplementedError(
+            "autograd_cache_key does not support nested container inputs"
+        )
+
+    compiler_config_extra = create_compiler_config_extra(graph)
+
+    # These context managers replicate the ones that _compile_fx_main sets up
+    # before calling aot_autograd, so that the config snapshot captured by
+    # autograd_cache_key is identical to a real compile_fx run:
+    #   _compile_fx_main outer with-block: _use_lazy_graph_module,
+    #       enable_python_dispatcher, preserve_node_meta,
+    #       reset_provenance_globals
+    #   _compile_fx_main aot_autograd with-block: V.set_fake_mode,
+    #       torch._guards.tracing, compiled_autograd._disable,
+    #       functorch_config.patch
+
+    fake_mode = detect_fake_mode(example_inputs) or torch._subclasses.FakeTensorMode(
+        allow_non_fake_inputs=True
+    )
+    tracing_context = (
+        torch._guards.TracingContext.try_get()
+        or torch._guards.TracingContext(fake_mode)
+    )
+
+    with (
+        functorch_config.patch(
+            unlift_effect_tokens=True, selective_decompose=config.selective_decompose
+        ),
+        _use_lazy_graph_module(dynamo_config.use_lazy_graph_module),
+        enable_python_dispatcher(),
+        torch.fx.traceback.preserve_node_meta(
+            config.trace.provenance_tracking_level == 1
+        ),
+        torch._inductor.debug.reset_provenance_globals(),
+        V.set_fake_mode(fake_mode),
+        torch._guards.tracing(tracing_context),
+        compiled_autograd._disable(),
+    ):
+        return aot_autograd.autograd_cache_key(
+            graph,
+            example_inputs,
+            ignore_shape_env=ignore_shape_env,
+            decompositions=decompositions,
+            compiler_config_extra=compiler_config_extra,
+            keep_inference_input_mutations=True,
+        )

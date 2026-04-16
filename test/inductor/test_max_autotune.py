@@ -708,7 +708,7 @@ class TestMaxAutotune(TestCase):
         a = a.repeat(8, 8)
         b = b.repeat(8, 8)
 
-        torch._dynamo.mark_dynamic(a, 0)
+        torch._dynamo.maybe_mark_dynamic(a, 0)
 
         with config.patch(
             {
@@ -906,7 +906,7 @@ class TestMaxAutotune(TestCase):
         a = a.repeat(8, 8)
         b = b.repeat(8, 8)
 
-        torch._dynamo.mark_dynamic(a, 0)
+        torch._dynamo.maybe_mark_dynamic(a, 0)
 
         with config.patch(
             {
@@ -1565,7 +1565,6 @@ class TestMaxAutotune(TestCase):
             if not same(expect, actual, tol=1e-2):
                 raise AssertionError(f"ref:\n{expect}\nact:\n{actual}")
 
-    @skipIfRocm(msg="Fails with Triton 3.7")
     @unittest.skipIf(
         config.cpp_wrapper, "decompose_k not supported for cpp_wrapper yet"
     )
@@ -1689,7 +1688,6 @@ class TestMaxAutotune(TestCase):
                 bf16_red_setting
             )
 
-    @skipIfRocm(msg="Fails with Triton 3.7")
     @unittest.skipIf(
         config.cpp_wrapper, "decompose_k not supported for cpp_wrapper yet"
     )
@@ -1743,7 +1741,6 @@ class TestMaxAutotune(TestCase):
                     rtol=1e-4,
                 )
 
-    @skipIfRocm(msg="Fails with Triton 3.7")
     @unittest.skipIf(
         config.cpp_wrapper, "decompose_k not supported for cpp_wrapper yet"
     )
@@ -1799,7 +1796,6 @@ class TestMaxAutotune(TestCase):
                     code[1]
                 )
 
-    @skipIfRocm(msg="Fails with Triton 3.7")
     @unittest.skipIf(
         config.cpp_wrapper, "decompose_k not supported for cpp_wrapper yet"
     )
@@ -1851,7 +1847,6 @@ class TestMaxAutotune(TestCase):
                     f" empty_strided_{GPU_TYPE}((256, 1096), (1096, 1), torch.bfloat16)"
                 ).run(code[0])
 
-    @skipIfRocm(msg="Fails with Triton 3.7")
     @unittest.skipIf(not torch.version.hip, "ROCM only")
     @parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
     @parametrize("sizes", ((64, 128, 256), (128, 256, 512), (256, 512, 1024)))
@@ -1895,7 +1890,6 @@ class TestMaxAutotune(TestCase):
             # Check that contiguous transform was used
             FileCheck().check("contiguous_mm").run(code[0])
 
-    @skipIfRocm(msg="Fails with Triton 3.7")
     @unittest.skipIf(not torch.version.hip, "ROCM only")
     @parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
     @parametrize("sizes", ((64, 128, 256), (128, 256, 512), (256, 512, 1024)))
@@ -2007,7 +2001,6 @@ class TestMaxAutotune(TestCase):
             out2, expected2_fp64.to(torch.float32), atol=1e-2, rtol=1e-2
         )
 
-    @skipIfRocm(msg="Fails with Triton 3.7")
     @unittest.skipIf(not torch.version.hip, "ROCM only")
     @config.patch(
         max_autotune=True,
@@ -2131,20 +2124,32 @@ class TestMaxAutotune(TestCase):
 
         a = torch.randn(2, 3, 4, device=GPU_TYPE, dtype=torch.float16)
         b = torch.randn(2, 4, 5, device=GPU_TYPE, dtype=torch.float16)
+        expected = torch.bmm(a.float(), b.float())
+        with config.patch(
+            max_autotune=False,
+            max_autotune_gemm_backends="ATEN",
+        ):
+            compiled_f = torch.compile(f)
+            out, code = run_and_get_code(compiled_f, a, b)
+            FileCheck().check("extern_kernels.bmm_dtype").run(code[0])
+            self.assertEqual(out, expected, atol=1e-3, rtol=1e-3)
+
+    @unittest.skipIf(config.cpp_wrapper, "out_dtype override not supported for AOTI")
+    def test_triton_bmm_out_dtype(self):
+        def f(a, b, out_dtype=torch.float32):
+            return torch.bmm(a, b, out_dtype=out_dtype)
+
+        a = torch.randn(2, 3, 4, device=GPU_TYPE, dtype=torch.float16)
+        b = torch.randn(2, 4, 5, device=GPU_TYPE, dtype=torch.float16)
+        expected = torch.bmm(a.float(), b.float())
         with config.patch(
             max_autotune=True,
             max_autotune_gemm_backends="TRITON",
         ):
             compiled_f = torch.compile(f)
-            with self.assertRaisesRegex(
-                torch._inductor.exc.InductorError,
-                r"LoweringException: NoValidChoicesError: No choices to select",
-            ):
-                out, code = run_and_get_code(compiled_f, a, b)
-
-        compiled_f = torch.compile(f)
-        out, code = run_and_get_code(compiled_f, a, b)
-        FileCheck().check("extern_kernels.bmm_dtype").run(code[0])
+            out, code = run_and_get_code(compiled_f, a, b, out_dtype=torch.float32)
+            FileCheck().check("triton_tem_fused_bmm").run(code[0])
+            self.assertEqual(out, expected, atol=1e-3, rtol=1e-3)
 
     def test_triton_template_generated_code_cache_key(self):
         generate_and_load_args = len(
@@ -2252,7 +2257,7 @@ class TestMaxAutotune(TestCase):
                         'num_consumer_groups':0,'num_buffers_warp_spec':0,'epilogue_fn_hash':'identity','tma_store':False,
                         'transpose_discontiguous_tensor_descriptors_override':None,
                         'kwargs':{'EVEN_K':False,'USE_FAST_ACCUM':False,'ACC_TYPE':'tl.float32',
-                        'BLOCK_M':16,'BLOCK_N':32,'BLOCK_K':16,'GROUP_M':8,'ALLOW_TF32':True},
+                        'OUT_DTYPE':'tl.float32','BLOCK_M':16,'BLOCK_N':32,'BLOCK_K':16,'GROUP_M':8,'ALLOW_TF32':True},
                         'hint_override':None,'triton_meta':None}"""
 
                 expected = expected.replace("cuda", GPU_TYPE)
@@ -2293,7 +2298,7 @@ class TestMaxAutotune(TestCase):
                     'layout':"[[s77,s94],[s94,1],torch.float32,device(type='cuda',index=0),0]",'num_consumer_groups':0,
                     'num_buffers_warp_spec':0,'epilogue_fn_hash':'identity','tma_store':False,
                     'transpose_discontiguous_tensor_descriptors_override':None,
-                    'kwargs':{'EVEN_K':False,'USE_FAST_ACCUM':False,'ACC_TYPE':'tl.float32','BLOCK_M':16,'BLOCK_N':32,
+                    'kwargs':{'EVEN_K':False,'USE_FAST_ACCUM':False,'ACC_TYPE':'tl.float32','OUT_DTYPE':'tl.float32','BLOCK_M':16,'BLOCK_N':32,
                     'BLOCK_K':16,'GROUP_M':8,'ALLOW_TF32':True},'hint_override':None,'triton_meta':None}"""
                 expected = expected.replace("cuda", GPU_TYPE)
                 self.assertExpectedInline(
@@ -2458,7 +2463,6 @@ class TestMaxAutotune(TestCase):
             self.assertEqual(misses(), 4)
 
     @fresh_cache()
-    @skipIfRocm(msg="Fails with Triton 3.7")
     @unittest.skipIf(
         config.cpp_wrapper, "decompose_k not supported for cpp_wrapper yet"
     )
@@ -2812,7 +2816,6 @@ class TestMaxAutotune(TestCase):
         self.assertObjectIn(k, (15, 16))
         self.assertEqual("'EVEN_K': True" in cache_key, k == 16 and not dynamic)
 
-    @skipIfRocm(msg="Fails with Triton 3.7")
     @config.patch(
         {
             "max_autotune": True,
@@ -3023,6 +3026,49 @@ class TestMaxAutotune(TestCase):
     @fresh_cache()
     @skipIfXpu
     @unittest.skipIf(TEST_WITH_ROCM, "Test requires CUDA")
+    @largeTensorTest("6 GB", device=GPU_TYPE)
+    def test_max_autotune_mm_large_storage_offset_i64_indexing(self):
+        """
+        Test mm with input having dynamic storage offset exceeding i32 range.
+        When a dynamic-shaped input is a slice with offset proportional to
+        the dynamic dim (e.g., offset=70000*s6), the ks parameter in the
+        triton template signature must use i64 to avoid overflow in pointer
+        arithmetic like `A = arg_A + 70000*ks0`.
+        """
+
+        def mm(x, w):
+            batch = x.shape[0] // 8
+            a = x[7 * batch :]
+            return torch.mm(a, w)
+
+        K, N = 10000, 32
+        batch = 32768
+        x = torch.randn(8 * batch, K, device=GPU_TYPE, dtype=torch.bfloat16)
+        w = torch.randn(K, N, device=GPU_TYPE, dtype=torch.bfloat16)
+
+        expected_offset = 7 * batch * K
+        self.assertTrue(
+            expected_offset > 2**31 - 1,
+            f"Test requires offset > i32_max, got {expected_offset}",
+        )
+
+        torch._dynamo.mark_dynamic(x, 0)
+
+        with config.patch(
+            {
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "test_configs.autotune_choice_name_regex": r"^triton_mm_",
+            }
+        ):
+            result = torch.compile(mm)(x, w)
+
+        a = x[7 * batch :]
+        torch.testing.assert_close(result, torch.mm(a, w), rtol=1e-2, atol=1e-2)
+
+    @fresh_cache()
+    @skipIfXpu
+    @unittest.skipIf(TEST_WITH_ROCM, "Test requires CUDA")
     @unittest.skipIf(
         not SM90OrLater, "Requires SM90+ (H100/B200) for sufficient GPU memory"
     )
@@ -3098,6 +3144,58 @@ class TestMaxAutotune(TestCase):
             result = torch.compile(mm)(a, b)
 
         torch.testing.assert_close(result, torch.mm(a, b), rtol=1e-2, atol=1e-2)
+
+    @fresh_cache()
+    @config.patch(
+        {
+            "max_autotune": True,
+            "test_configs.max_mm_configs": 1,
+        }
+    )
+    def test_deferred_layout_constraint_reinterpret_3d(self):
+        batch, m, k, n = 32, 40, 1053, 40
+        batch_stride = 42176
+
+        a = torch.randn(batch, m, k, dtype=torch.bfloat16, device=GPU_TYPE)
+        b = torch.empty_strided(
+            size=(batch, k * n),
+            stride=(batch_stride, 1),
+            dtype=torch.bfloat16,
+            device=GPU_TYPE,
+        )
+        b.copy_(torch.randn_like(b))
+        c = torch.randn(batch, n, m, dtype=torch.bfloat16, device=GPU_TYPE)
+        idx0 = torch.tensor([0], device=GPU_TYPE)
+        idx1 = torch.tensor([0], device=GPU_TYPE)
+        value = torch.zeros(1, dtype=torch.bfloat16, device=GPU_TYPE)
+
+        def fn(a, b, c, idx0, idx1, value):
+            # Mirror the 2D regression first: a simple pointwise op gives us a
+            # rank-2 FlexibleLayout. Then force that 2D value to realize before
+            # reinterpreting it as the rank-3 view from the original repro.
+            b_flex_2d = b + 0
+            b_flex_2d = aten.index_put.default(b_flex_2d, (idx0, idx1), value, False)
+            b_view_3d = b_flex_2d.view(batch, k, n)
+            return (
+                torch.bmm(a, b_view_3d).to(torch.float32),
+                b_flex_2d + 1.0,
+                torch.bmm(b_view_3d, c).to(torch.float32),
+            )
+
+        with (
+            mock.patch(
+                "torch._inductor.autotune_process.run_autotune_in_subprocess",
+                mock_benchmark_choice_wrapper(aten_time=1.0, triton_time=0.1),
+            ),
+            mock.patch.object(
+                AlgorithmSelectorCache,
+                "benchmark_choice",
+                mock_benchmark_choice_wrapper(aten_time=1.0, triton_time=0.1),
+            ),
+        ):
+            compiled_fn = torch.compile(fn)
+            _, code = run_and_get_code(compiled_fn, a, b, c, idx0, idx1, value)
+            FileCheck().check("triton_tem_fused").run(code[0])
 
 
 @instantiate_parametrized_tests
@@ -4739,7 +4837,6 @@ class TestEpilogueFusionStaticAnalysis(TestCase):
                 tma_heuristic.mm_configs = original_tma_mm_configs
                 mm_heuristic.mm_configs = original_mm_mm_configs
 
-    @skipIfRocm(msg="Fails with Triton 3.7")
     @unittest.skipIf(
         not HAS_CUDA_AND_TRITON, "Scheduler static analysis only tested on cuda"
     )

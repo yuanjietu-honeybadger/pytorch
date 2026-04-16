@@ -801,6 +801,9 @@ class BypassFxGraphCache(Exception):
     """
 
 
+_warned_pre_grad_pass_missing_uuid: OrderedSet[str] = OrderedSet()
+
+
 def resolve_pre_grad_pass_timing() -> Literal["early", "late"]:
     """Resolve the effective pre-grad pass timing from the config.
 
@@ -822,6 +825,21 @@ def resolve_pre_grad_pass_timing() -> Literal["early", "late"]:
     if timing == "default":
         supports_late = custom_pass is None or has_uuid
         timing = "late" if supports_late else "early"
+        if timing == "early" and custom_pass:
+            pass_name = type(custom_pass).__qualname__
+            if pass_name not in _warned_pre_grad_pass_missing_uuid:
+                _warned_pre_grad_pass_missing_uuid.add(pass_name)
+                log.warning(
+                    "pre_grad_custom_pass %s does not implement uuid(); "
+                    "falling back to early timing (pre-grad pass cache will be bypassed). "
+                    "Implement uuid() on your CustomGraphPass to enable caching.",
+                    pass_name,
+                )
+                CompileEventLogger.try_add_pt2_compile(
+                    "backend_compile",
+                    pre_grad_pass_missing_uuid=True,
+                    pre_grad_pass_name=pass_name,
+                )
 
     if timing == "late" and custom_pass and not has_uuid:
         raise RuntimeError(
@@ -844,8 +862,10 @@ class FxGraphHashDetails:
     a safe and stable cache key.
     """
 
-    # Excluded kwargs param that are not stable between runs
-    EXCLUDED_KWARGS = ["graph_id"]
+    # Excluded kwargs param that are not stable between runs or that
+    # don't affect compiled output (like compile_region_name which is
+    # just a debug label).
+    EXCLUDED_KWARGS = ["graph_id", "compile_region_name"]
 
     def __init__(
         self,
@@ -949,6 +969,12 @@ class FxGraphHashDetails:
             torch.is_deterministic_algorithms_warn_only_enabled(),
             torch.utils.deterministic.fill_uninitialized_memory,  # type: ignore[attr-defined]
         )
+
+        # Provenance tracking level affects whether provenance data is stored
+        # in the CompiledFxGraph, so it must be part of the cache key.
+        # Note: the "trace" prefix is excluded from _cache_config_ignore_prefix,
+        # so we add this explicitly.
+        self.provenance_tracking_level = config.trace.provenance_tracking_level
 
         # Global settings affecting matmul codegen.
         self.cuda_matmul_settings = (
@@ -4039,8 +4065,12 @@ class DLLWrapper:
     ) -> None:
         self.lib_path = lib_path
         self.is_open = False
-        self.DLL = cdll.LoadLibrary(lib_path)
-        self.is_open = True
+        self.open()
+
+    def open(self) -> None:
+        if not self.is_open:
+            self.DLL = cdll.LoadLibrary(self.lib_path)
+            self.is_open = True
 
     def close(self) -> None:
         if self.is_open:
@@ -4049,7 +4079,16 @@ class DLLWrapper:
 
     def _dlclose(self) -> None:
         f_dlclose = None
+        # During Python interpreter shutdown, importing modules or calling
+        # dlclose is unsafe. Silently skip cleanup in that case.
+        try:
+            import sys
 
+            if sys.is_finalizing():
+                return
+        except Exception:
+            # import machinery may already be torn down
+            return
         if is_linux():
             syms = CDLL(None)
             if not hasattr(syms, "dlclose"):
@@ -4430,6 +4469,7 @@ from torch._inductor.codegen.xpu import compile_utils as xpu_compile_utils
 class XPUCodeCache(CUTLASSCodeCache):
     _SOURCE_CODE_SUFFIX = "cpp"
     _BACKEND = "XPU"
+    dll_cache: dict[str, DLLWrapper] = {}
 
     @classmethod
     def _use_re_build(cls) -> bool:
@@ -4457,6 +4497,26 @@ class XPUCodeCache(CUTLASSCodeCache):
             ]
         )
         return extra
+
+    @classmethod
+    def load(cls, source_code: str, dst_file_ext: str) -> tuple[DLLWrapper, str, str]:
+        """
+        Compiles source code and loads the generated .so file.
+        Returns a tuple of DLLWrapper, hash_key, source_code_path
+        """
+
+        if dst_file_ext != "so":
+            raise RuntimeError(
+                f"Only support loading a .so file for now. "
+                f"Requested file extension: {dst_file_ext}. Source code: {source_code}"
+            )
+        dst_file_path, hash_key, source_code_path = cls.compile(
+            source_code, dst_file_ext
+        )
+        if dst_file_path not in cls.dll_cache:
+            cls.dll_cache[dst_file_path] = DLLWrapper(dst_file_path)
+
+        return (cls.dll_cache[dst_file_path], hash_key, source_code_path)
 
 
 @clear_on_fresh_cache
