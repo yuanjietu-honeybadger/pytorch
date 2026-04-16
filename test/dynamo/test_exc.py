@@ -174,7 +174,7 @@ User code traceback:
     torch.compile(fn001, backend="eager")(torch.randn(1))
   File "test_exc.py", line N, in fn001
     return {1, 2}
-""",  # noqa: B950
+""",
         )
 
     @torch._dynamo.config.patch(suppress_errors=False)
@@ -238,7 +238,7 @@ User code traceback:
     return fn002(x)
   File "test_exc.py", line N, in fn002
     torch._dynamo.graph_break()
-""",  # noqa: B950
+""",
         )
 
     @make_logging_test(graph_breaks=True)
