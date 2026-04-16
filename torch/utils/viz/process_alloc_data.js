@@ -55,8 +55,12 @@
 //
 //   Block-level views ("Active Memory Timeline", "Allocated Memory (incl. Private Pools)"):
 //     - process_alloc_data matches "alloc" and "free_completed" from device_traces.
-//     - segment_alloc/segment_free/segment_map/segment_unmap are ignored (skipped in switch).
-//     - The segments snapshot is used only to resolve pool_id via find_pool_id().
+//     - segment_alloc/segment_free/segment_map/segment_unmap are skipped in the main
+//       alloc/free switch, but when include_private_inactive=true, segment events for
+//       private pools are captured separately (pool_segment_events) and used to drive
+//       pool envelope sizing based on reserved memory rather than active allocations.
+//     - The segments snapshot is used to resolve pool_id via find_pool_id() and to
+//       compute initial reserved memory per pool for envelope sizing.
 //
 //   Segment-level view ("Active Cached Segment Timeline"):
 //     - process_alloc_data is called with plot_segments=true.
@@ -320,9 +324,13 @@ function format_frames(frames) {
  *
  * 5. PRIVATE POOL ENVELOPES (include_private_inactive=true): Each private pool
  *    (e.g. FSDP's MemPool) gets a single gray "envelope" rectangle whose
- *    height is the pool's high-water mark. Active blocks within the pool are
+ *    height is the pool's reserved memory (from segment_map/segment_unmap
+ *    events and the segment snapshot). Active blocks within the pool are
  *    rendered as colored stripes inside the envelope. The envelope only grows
- *    (never shrinks), representing reserved capacity.
+ *    (never shrinks), representing the pool's actual GPU memory footprint.
+ *    This correctly handles fragmentation: when a large alloc triggers a
+ *    segment_map because existing free blocks aren't contiguous, the envelope
+ *    grows by the reserved amount, not just the active allocation.
  *
  *    Initially-allocated private pool blocks are PRE-LOADED into pool state
  *    so that when their free event appears in the trace, they are correctly
@@ -408,6 +416,11 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries, includ
   const [free, free_completed] = plot_segments
     ? ['segment_free', 'segment_free']
     : ['free', 'free_completed'];
+  // pool_segment_events tracks segment_map/segment_unmap events for private
+  // pools, recording their position relative to the actions list. This lets
+  // the Phase 3 replay grow pool envelopes based on actual reserved memory
+  // (segments) rather than just active allocations.
+  const pool_segment_events = [];
   for (const e of snapshot.device_traces[device]) {
     switch (e.action) {
       case alloc:
@@ -432,6 +445,19 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries, includ
         break;
       default:
         break;
+    }
+    if (include_private_inactive &&
+        (e.action === 'segment_alloc' || e.action === 'segment_free' ||
+         e.action === 'segment_map' || e.action === 'segment_unmap')) {
+      const pid = find_pool_id(e.addr);
+      if (isPrivatePoolId(pid)) {
+        const is_add = e.action === 'segment_alloc' || e.action === 'segment_map';
+        pool_segment_events.push({
+          position: actions.length,
+          delta: is_add ? e.size : -e.size,
+          pool_key: format_pool_key(pid, e.stream ?? 0),
+        });
+      }
     }
   }
 
@@ -560,17 +586,20 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries, includ
   const pools = {};
   const pool_active_elems = {};
 
+  function format_pool_key(pid, stream) {
+    return `${pid[0]},${pid[1]},s${stream}`;
+  }
+
   function get_pool_key(elem_idx) {
     const pid = elements[elem_idx].segment_pool_id;
     if (!isPrivatePoolId(pid)) return null;
-    const stream = elements[elem_idx].stream;
-    return `${pid[0]},${pid[1]},s${stream}`;
+    return format_pool_key(pid, elements[elem_idx].stream);
   }
 
   function get_or_create_pool(pool_key) {
     if (!(pool_key in pools)) {
       pools[pool_key] = {
-        max: 0, active: 0, envelope_data: null,
+        max: 0, active: 0, reserved: 0, envelope_data: null,
         block_stack: [],  // [{elem, size, inner_offset, stripe_data}]
       };
     }
@@ -615,12 +644,13 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries, includ
     }
   }
 
-  // Grow a pool envelope to accommodate new_active bytes.
-  // The envelope only grows (never shrinks) — it represents reserved capacity.
-  function grow_pool_envelope(pool, pool_key, new_active) {
-    if (new_active <= pool.max) return;
-    const delta = new_active - pool.max;
-    pool.max = new_active;
+  // Grow a pool envelope to accommodate new_size bytes (the larger of active
+  // allocations and reserved segment memory). The envelope only grows (never
+  // shrinks) — it represents the pool's actual GPU memory footprint.
+  function grow_pool_envelope(pool, pool_key, new_size) {
+    if (new_size <= pool.max) return;
+    const delta = new_size - pool.max;
+    pool.max = new_size;
     const env = pool.envelope_data;
     env.timesteps.push(timestep);
     env.offsets.push(env.offsets.at(-1));
@@ -665,9 +695,10 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries, includ
       pool.active += size;
 
       // Grow envelope directly without animation — these blocks pre-exist
-      if (pool.active > pool.max) {
-        const delta = pool.active - pool.max;
-        pool.max = pool.active;
+      const init_target = Math.max(pool.active, pool.reserved);
+      if (init_target > pool.max) {
+        const delta = init_target - pool.max;
+        pool.max = init_target;
         const env = pool.envelope_data;
         env.size[env.size.length - 1] = pool.max;
         total_mem += delta;
@@ -716,8 +747,85 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries, includ
     }
   }
 
+  // --- Initialize pool reserved memory from snapshot ---
+  // The envelope height for each private pool should reflect its reserved
+  // (segment) memory, not just active allocations. We compute the initial
+  // reserved value so that replaying segment_map/segment_unmap events from
+  // the trace arrives at the correct final value (the snapshot total).
+  //
+  // Formula: initial = snapshot_total - net_trace_delta
+  //   - snapshot_total: sum of segment total_size for this pool (ground truth
+  //     at snapshot time)
+  //   - net_trace_delta: sum of segment_map sizes minus segment_unmap sizes
+  //     for this pool in the trace
+  //
+  // This works regardless of trace truncation (ring buffer overflow): the
+  // initial value represents the reserved memory at the start of the trace
+  // window, not at program start. If there are no segment events in the
+  // trace for a pool, net_trace_delta is 0 and initial = snapshot_total.
+  if (include_private_inactive) {
+    const snapshot_reserved = {};
+    for (const seg of device_segments) {
+      const pid = seg.segment_pool_id;
+      if (isPrivatePoolId(pid)) {
+        const pk = format_pool_key(pid, seg.stream ?? 0);
+        snapshot_reserved[pk] = (snapshot_reserved[pk] || 0) + seg.total_size;
+      }
+    }
+    const net_from_trace = {};
+    for (const se of pool_segment_events) {
+      net_from_trace[se.pool_key] = (net_from_trace[se.pool_key] || 0) + se.delta;
+    }
+    for (const pk in snapshot_reserved) {
+      const pool = get_or_create_pool(pk);
+      pool.reserved = snapshot_reserved[pk] - (net_from_trace[pk] || 0);
+      // Grow envelope to initial reserved (no animation — pre-existing)
+      if (pool.reserved > pool.max && pool.envelope_data) {
+        const delta = pool.reserved - pool.max;
+        pool.max = pool.reserved;
+        const env = pool.envelope_data;
+        env.size[env.size.length - 1] = pool.max;
+        total_mem += delta;
+        const pidx = current.indexOf(`pool:${pk}`);
+        if (pidx >= 0) {
+          for (let j = pidx + 1; j < current.length; j++) {
+            const e = current_data[j];
+            e.offsets[e.offsets.length - 1] += delta;
+          }
+        }
+      }
+    }
+    // Fix up pool stripe offsets again after reserved-based envelope growth
+    for (const pk in pools) {
+      const p = pools[pk];
+      if (!p.envelope_data) continue;
+      const env_offset = p.envelope_data.offsets.at(-1);
+      for (const block of p.block_stack) {
+        const s = block.stripe_data;
+        for (let i = 0; i < s.offsets.length; i++) {
+          s.offsets[i] = env_offset + block.inner_offset;
+        }
+      }
+    }
+  }
+
   // --- Replay alloc/free actions to build the timeline ---
-  for (const elem of actions) {
+  let seg_event_idx = 0;
+  for (let action_i = 0; action_i < actions.length; action_i++) {
+    // Process segment events that occurred at or before this action position.
+    // These grow pool envelopes based on actual reserved memory changes.
+    while (seg_event_idx < pool_segment_events.length &&
+           pool_segment_events[seg_event_idx].position <= action_i) {
+      const se = pool_segment_events[seg_event_idx];
+      const pool = get_or_create_pool(se.pool_key);
+      pool.reserved += se.delta;
+      if (pool.reserved > pool.max && pool.envelope_data) {
+        grow_pool_envelope(pool, se.pool_key, pool.reserved);
+      }
+      seg_event_idx++;
+    }
+
+    const elem = actions[action_i];
     const size = elements[elem].size;
     const pool_key = include_private_inactive ? get_pool_key(elem) : null;
 
@@ -745,8 +853,9 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries, includ
         const inner_offset = pool.active;
         pool.active += size;
 
-        if (pool.active > pool.max) {
-          grow_pool_envelope(pool, pool_key, pool.active);
+        const envelope_target = Math.max(pool.active, pool.reserved);
+        if (envelope_target > pool.max) {
+          grow_pool_envelope(pool, pool_key, envelope_target);
         }
 
         const stripe = {
@@ -832,6 +941,18 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries, includ
       total_mem -= size;
     }
     max_size = Math.max(total_mem + total_summarized_mem, max_size);
+  }
+
+  // Process any remaining segment events after the last action
+  while (seg_event_idx < pool_segment_events.length) {
+    const se = pool_segment_events[seg_event_idx];
+    const pool = get_or_create_pool(se.pool_key);
+    pool.reserved += se.delta;
+    if (pool.reserved > pool.max && pool.envelope_data) {
+      grow_pool_envelope(pool, se.pool_key, pool.reserved);
+    }
+    max_size = Math.max(total_mem + total_summarized_mem, max_size);
+    seg_event_idx++;
   }
 
   // --- Finalize: close all still-active elements ---
