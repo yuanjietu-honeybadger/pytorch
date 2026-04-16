@@ -791,6 +791,7 @@ def dynamo_timed(
 
     chromium_log: ChromiumEventLogger = get_chromium_event_logger()
     start_ns = time.time_ns()
+    start_thread_ns = time.thread_time_ns()
     chromium_log.log_event_start(
         event_name, start_ns, event_metadata, log_pt2_compile_event, compile_id
     )
@@ -826,9 +827,22 @@ def dynamo_timed(
     finally:
         end_ns = time.time_ns()
         time_spent_ns = end_ns - start_ns
+        thread_time_spent_ns = time.thread_time_ns() - start_thread_ns
         metrics.append(time_spent_ns / 1e9)
         chromium_log.log_event_end(
-            event_name, end_ns, {}, start_ns, log_pt2_compile_event, compile_id
+            event_name,
+            end_ns,
+            {
+                "thread_time_ns": thread_time_spent_ns,
+                "idle_pct": round(
+                    (1 - thread_time_spent_ns / time_spent_ns) * 100, 1
+                )
+                if time_spent_ns > 0
+                else 0,
+            },
+            start_ns,
+            log_pt2_compile_event,
+            compile_id,
         )
         if dynamo_compile_column_us:
             # TODO: the events that we capture in calculate_time_spent() seem a little
