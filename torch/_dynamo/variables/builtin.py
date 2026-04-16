@@ -1087,6 +1087,20 @@ class BuiltinVariable(BaseBuiltinVariable):
 
             return create_exception_class_object
 
+        if fn is object and not arg_types and not has_kwargs:
+            # object() creates an opaque, immutable sentinel used for
+            # identity checks.  Treat it as a constant so it can
+            # participate in constant folding (e.g. max(..., default=sentinel)).
+
+            def create_object_sentinel(
+                tx: "InstructionTranslator",
+                args: list[VariableTracker],
+                kwargs: dict[str, VariableTracker],
+            ) -> VariableTracker:
+                return VariableTracker.build(tx, object())
+
+            return create_object_sentinel
+
         if obj.can_insert_in_graph() and not (
             fn is operator.getitem
             and not issubclass(arg_types[0], variables.TensorVariable)
