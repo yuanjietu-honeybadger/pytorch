@@ -978,6 +978,8 @@ combo_kernel_max_num_args = 250
 combo_kernel_per_subkernel_blocks = False
 # When True, only pointwise kernels are eligible for combo kernel fusion.
 combo_kernels_pointwise_only = False
+combo_kernel_peak_memory_threshold: int = 0
+combo_kernel_max_distance: int = 512
 
 # constant folding on the joint graph
 joint_graph_constant_folding = True

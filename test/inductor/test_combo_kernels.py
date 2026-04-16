@@ -1340,6 +1340,162 @@ class ComboKernelTestsMaxAutotune(TestCase):
         self.assertEqual(found_hints["reduction_hint_1"], "OUTER")
 
 
+class ComboKernelPeakMemoryTests(TestCase):
+    def setUp(self):
+        super().setUp()
+        torch._inductor.metrics.reset()
+        self._test_stack = contextlib.ExitStack()
+        self._test_stack.enter_context(
+            torch._inductor.config.patch(
+                {
+                    "combo_kernels": True,
+                    "combo_kernel_per_subkernel_blocks": True,
+                    "benchmark_combo_kernel": False,
+                }
+            )
+        )
+
+    def tearDown(self):
+        self._test_stack.close()
+        torch._inductor.metrics.reset()
+        super().tearDown()
+
+    @staticmethod
+    def _make_wide_resnet_like():
+        """Build a WideResNet-like model."""
+
+        class Bottleneck(torch.nn.Module):
+            expansion = 4
+
+            def __init__(self, in_ch, mid_ch, stride=1, downsample=None):
+                super().__init__()
+                self.conv1 = torch.nn.Conv2d(in_ch, mid_ch, 1, bias=False)
+                self.bn1 = torch.nn.BatchNorm2d(mid_ch)
+                self.conv2 = torch.nn.Conv2d(
+                    mid_ch, mid_ch, 3, stride=stride, padding=1, bias=False
+                )
+                self.bn2 = torch.nn.BatchNorm2d(mid_ch)
+                self.conv3 = torch.nn.Conv2d(
+                    mid_ch, mid_ch * self.expansion, 1, bias=False
+                )
+                self.bn3 = torch.nn.BatchNorm2d(mid_ch * self.expansion)
+                self.relu = torch.nn.ReLU(inplace=True)
+                self.downsample = downsample
+
+            def forward(self, x):
+                identity = x
+                out = self.relu(self.bn1(self.conv1(x)))
+                out = self.relu(self.bn2(self.conv2(out)))
+                out = self.bn3(self.conv3(out))
+                if self.downsample is not None:
+                    identity = self.downsample(x)
+                return self.relu(out + identity)
+
+        def make_layer(in_ch, mid_ch, blocks, stride=1):
+            downsample = torch.nn.Sequential(
+                torch.nn.Conv2d(in_ch, mid_ch * 4, 1, stride=stride, bias=False),
+                torch.nn.BatchNorm2d(mid_ch * 4),
+            )
+            layers = [Bottleneck(in_ch, mid_ch, stride, downsample)]
+            for _ in range(1, blocks):
+                layers.append(Bottleneck(mid_ch * 4, mid_ch))
+            return torch.nn.Sequential(*layers)
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv1 = torch.nn.Conv2d(3, 64, 7, stride=2, padding=3, bias=False)
+                self.bn1 = torch.nn.BatchNorm2d(64)
+                self.relu = torch.nn.ReLU(inplace=True)
+                self.maxpool = torch.nn.MaxPool2d(3, stride=2, padding=1)
+                self.layer1 = make_layer(64, 128, blocks=3)
+                self.layer2 = make_layer(512, 256, blocks=4, stride=2)
+                self.layer3 = make_layer(1024, 512, blocks=20, stride=2)
+                self.avgpool = torch.nn.AdaptiveAvgPool2d(1)
+                self.fc = torch.nn.Linear(2048, 1000)
+
+            def forward(self, x):
+                x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
+                x = self.layer1(x)
+                x = self.layer2(x)
+                x = self.layer3(x)
+                return self.fc(self.avgpool(x).flatten(1))
+
+        return Model()
+
+    @requires_gpu_and_triton
+    def test_combo_kernel_peak_memory_threshold(self):
+        """
+        The model has 20 wide bottleneck blocks creating many BN/relu ops
+        at the same topological level.  Default combo fusion groups them into
+        wide-span combos that co-allocate large intermediate buffers,
+        adding ~60 MB peak overhead.  The threshold detects this via
+        _estimate_peak_for_nodes and rejects the heavy groups.
+
+        Sweeps threshold from 1GB (accept all) down to 1B (reject most).
+        Verifies:
+          1. Correctness at every threshold.
+          2. Tight threshold rejects groups -> strictly more kernels.
+          3. Tight threshold reduces CUDA peak memory.
+          4. Monotonicity: kernels non-decreasing as threshold shrinks.
+        """
+        import gc
+
+        model = self._make_wide_resnet_like().to(GPU_TYPE).eval()
+        x = torch.randn(1, 3, 224, 224, device=GPU_TYPE)
+        with torch.no_grad():
+            out_eager = model(x)
+
+        thresholds = [1024 * 1024 * 1024, 1024 * 1024, 1]
+        prev_kernels = None
+        kernel_counts = {}
+        peak_memory = {}
+
+        for threshold in thresholds:
+            torch._dynamo.reset()
+            torch._inductor.metrics.reset()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            with torch._inductor.config.patch(
+                combo_kernel_peak_memory_threshold=threshold
+            ):
+                compiled_fn = torch.compile(model)
+                with torch.no_grad():
+                    out_compiled = compiled_fn(x)
+
+            self.assertEqual(out_eager, out_compiled)
+
+            kernels = torch._inductor.metrics.generated_kernel_count
+            kernel_counts[threshold] = kernels
+
+            # Monotonicity
+            if prev_kernels is not None:
+                self.assertGreaterEqual(kernels, prev_kernels)
+            prev_kernels = kernels
+
+            # Measure CUDA peak
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            with torch.no_grad():
+                compiled_fn(x)
+            torch.cuda.synchronize()
+            peak_memory[threshold] = torch.cuda.max_memory_allocated()
+
+        self.assertGreater(
+            kernel_counts[1],
+            kernel_counts[1024 * 1024 * 1024],
+            "Tight threshold should reject wide-span combo groups",
+        )
+
+        self.assertLess(
+            peak_memory[1],
+            peak_memory[1024 * 1024 * 1024],
+            "Tight threshold should reduce peak memory by rejecting "
+            "combo groups that co-allocate large intermediates",
+        )
+
 if __name__ == "__main__":
     from torch._dynamo.test_case import run_tests
 

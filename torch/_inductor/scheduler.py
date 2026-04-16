@@ -5037,12 +5037,35 @@ class Scheduler:
 
     def create_combo_kernel_nodes(self, num_ck_nodes: int | None = None) -> None:
         """
-        Groups parallel nodes
+        Groups parallel nodes into combo kernels (ForeachKernelSchedulerNode).
+
+        When combo_kernel_peak_memory_threshold > 0, each group is simulated
+        before creation: if the combo would increase peak memory beyond the
+        threshold, the group is rejected or greedy exclusion.
         """
         fused_nodes = OrderedSet(self.nodes)
         count = 0
         num_nodes_orig = len(self.nodes)
         log.debug("ComboKernels: Generating with num_ck_nodes = %s...", num_ck_nodes)
+
+        threshold = config.combo_kernel_peak_memory_threshold
+        if threshold > 0:
+            from .memory import prepare_planning_info
+
+            baseline_peak, name_to_freeable = prepare_planning_info(
+                self.nodes,
+                self.name_to_buf,
+                self.name_to_fused_node,
+                OrderedSet(V.graph.graph_inputs.keys()),
+                OrderedSet(V.graph.get_output_names()),
+            )
+            graph_outputs = OrderedSet(V.graph.get_output_names())
+            fused_node_step_map: dict[BaseSchedulerNode, BaseSchedulerNode] = {}
+            log.debug(
+                "ComboKernels memory-aware: baseline peak = %d bytes",
+                baseline_peak,
+            )
+
         for num, node_list in enumerate(
             ForeachKernelSchedulerNode.group_nodes_for_combo_kernels(self)
         ):
@@ -5054,14 +5077,55 @@ class Scheduler:
             if not self.speedup_by_combo_kernel(node_list):
                 log.debug("ComboKernels: Not speeding up %d-th group", num)
                 continue
+
+            if threshold > 0:
+                combo_node, new_peak = self._try_combo_with_memory_check(
+                    node_list,
+                    name_to_freeable,
+                    graph_outputs,
+                    baseline_peak,
+                    fused_node_step_map,
+                )
+                # Rejected — drop largest-output nodes one at a time
+                if combo_node is None:
+                    sorted_by_size = sorted(
+                        node_list,
+                        key=lambda n: sum(
+                            b.mpi_buffer.size_alloc for b in n.get_outputs()
+                        ),
+                        reverse=True,
+                    )
+                    excluded: OrderedSet[BaseSchedulerNode] = OrderedSet()
+                    for drop in sorted_by_size:
+                        excluded.add(drop)
+                        candidate = [n for n in node_list if n not in excluded]
+                        if len(candidate) < 2:
+                            break
+                        combo_node, new_peak = self._try_combo_with_memory_check(
+                            candidate,
+                            name_to_freeable,
+                            graph_outputs,
+                            baseline_peak,
+                            fused_node_step_map,
+                        )
+                        if combo_node is not None:
+                            node_list = candidate
+                            break
+                    if combo_node is None:
+                        continue
+                baseline_peak = new_peak
+                for node in node_list:
+                    fused_node_step_map[node] = combo_node
+            else:
+                enable_autotune = config.combo_kernels_autotune > 0
+                combo_node = ForeachKernelSchedulerNode(
+                    node_list[0].scheduler,
+                    node_list,
+                    use_custom_partition_algo=True,
+                    enable_autotune=enable_autotune,
+                )
+
             count += 1
-            enable_autotune = config.combo_kernels_autotune > 0
-            group_snode = ForeachKernelSchedulerNode(
-                node_list[0].scheduler,
-                node_list,
-                use_custom_partition_algo=True,
-                enable_autotune=enable_autotune,
-            )
             log.info(
                 "ComboKernels: Combining %d nodes for %d-th group",
                 len(node_list),
@@ -5069,15 +5133,14 @@ class Scheduler:
             )
             for node in node_list:
                 fused_nodes.remove(node)
-            fused_nodes.add(group_snode)
+            fused_nodes.add(combo_node)
             self.name_to_fused_node.update(
-                {n.get_name(): group_snode for n in group_snode.get_nodes()}
+                {n.get_name(): combo_node for n in combo_node.get_nodes()}
             )
-            # Propagate stream assignment so codegen can place the combo
-            # kernel in the correct stream context.
             stream = self.node_to_stream.get(node_list[0])
             if stream is not None:
-                self.node_to_stream[group_snode] = stream
+                self.node_to_stream[combo_node] = stream
+
         self.nodes = sorted(fused_nodes, key=lambda x: x.min_order)
         self.nodes = self.topological_sort_schedule(self.nodes)
         log.info(
@@ -5087,6 +5150,115 @@ class Scheduler:
             len(self.nodes),
         )
         self.prune_redundant_deps(self.nodes)
+
+    def _try_combo_with_memory_check(
+        self,
+        group_nodes: list[BaseSchedulerNode],
+        name_to_freeable_input_buf: dict[str, Any],
+        graph_outputs: OrderedSet[str],
+        baseline_peak: int,
+        fused_node_step_map: dict[BaseSchedulerNode, BaseSchedulerNode],
+    ) -> tuple[ForeachKernelSchedulerNode | None, int]:
+        enable_autotune = config.combo_kernels_autotune > 0
+        combo_node = ForeachKernelSchedulerNode(
+            group_nodes[0].scheduler,
+            group_nodes,
+            use_custom_partition_algo=True,
+            enable_autotune=enable_autotune,
+        )
+
+        node_to_idx = {node: idx for idx, node in enumerate(self.nodes)}
+        region_start = min(node_to_idx[n] for n in group_nodes)
+        region_end = max(node_to_idx[n] for n in group_nodes)
+
+        group_set = OrderedSet(group_nodes)
+        local_nodes: list[BaseSchedulerNode] = [combo_node]
+        for i in range(region_start, region_end + 1):
+            if self.nodes[i] not in group_set:
+                local_nodes.append(self.nodes[i])
+        local_nodes = self.topological_sort_schedule(local_nodes)
+
+        modified_nodes = (
+            list(self.nodes[:region_start])
+            + local_nodes
+            + list(self.nodes[region_end + 1 :])
+        )
+
+        current_map = dict(fused_node_step_map)
+        for node in group_nodes:
+            current_map[node] = combo_node
+
+        new_peak = self._estimate_peak_for_nodes(
+            modified_nodes,
+            name_to_freeable_input_buf,
+            graph_outputs,
+            current_map,
+        )
+
+        threshold = config.combo_kernel_peak_memory_threshold
+        if new_peak - baseline_peak <= threshold:
+            log.info(
+                "ComboKernels memory-aware: accepted group of %d nodes "
+                "(peak delta %+d bytes)",
+                len(group_nodes),
+                new_peak - baseline_peak,
+            )
+            return combo_node, new_peak
+        else:
+            log.debug(
+                "ComboKernels memory-aware: rejected group of %d nodes "
+                "(peak delta %+d bytes > threshold %d)",
+                len(group_nodes),
+                new_peak - baseline_peak,
+                threshold,
+            )
+            return None, baseline_peak
+
+    def _estimate_peak_for_nodes(
+        self,
+        nodes: list[BaseSchedulerNode],
+        name_to_freeable_input_buf: dict[str, Any],
+        graph_outputs: OrderedSet[str],
+        fused_node_step_map: dict[BaseSchedulerNode, BaseSchedulerNode],
+    ) -> int:
+        node_to_step: dict[BaseSchedulerNode, int] = {
+            node: step for step, node in enumerate(nodes)
+        }
+
+        for old_node, combo_node in fused_node_step_map.items():
+            if combo_node in node_to_step:
+                node_to_step[old_node] = node_to_step[combo_node]
+
+        total_steps = len(nodes)
+        memory = [0] * (total_steps + 1)
+
+        def get_end_step(buf: Any) -> int:
+            succ_nodes = buf.mpi_buffer.succ_nodes
+            if not succ_nodes:
+                return -1
+            return max(node_to_step[s] for s in succ_nodes)
+
+        for buf_name, input_buf in name_to_freeable_input_buf.items():
+            end_step = -1 if buf_name in graph_outputs else get_end_step(input_buf)
+            memory[0] += input_buf.mpi_buffer.size_free
+            memory[end_step + 1] -= input_buf.mpi_buffer.size_free
+
+        for step, node in enumerate(nodes):
+            for sched_buf in node.get_outputs():
+                buf_name = sched_buf.get_name()
+                end_step = -1
+                if buf_name not in graph_outputs:
+                    end_step = get_end_step(sched_buf)
+                    if end_step == -1:
+                        end_step = step
+                memory[step] += sched_buf.mpi_buffer.size_alloc
+                memory[end_step + 1] -= sched_buf.mpi_buffer.size_free
+
+        peak = cur = 0
+        for t in range(total_steps + 1):
+            cur += memory[t]
+            peak = max(peak, cur)
+        return peak
 
     def prune_redundant_deps(self, nodes: list[BaseSchedulerNode]) -> None:
         for node in nodes:
