@@ -224,7 +224,8 @@ class CacheBase:
     @clear_on_fresh_cache
     @functools.cache
     def get_local_cache_path() -> Path:
-        return Path(os.path.join(cache_dir(), "cache", CacheBase.get_system()["hash"]))
+        root = os.environ.get("TORCHINDUCTOR_PERSISTENT_AUTOTUNE_DIR") or cache_dir()
+        return Path(os.path.join(root, "cache", CacheBase.get_system()["hash"]))
 
     def __init__(self) -> None:
         self.system = CacheBase.get_system()
@@ -311,7 +312,10 @@ class PersistentCache(CacheBase):
                     break
             return hit
 
-        local_cache = self.get_local_cache() if config.autotune_local_cache else {}
+        cache_enabled = config.autotune_local_cache or bool(
+            os.environ.get("TORCHINDUCTOR_PERSISTENT_AUTOTUNE_DIR")
+        )
+        local_cache = self.get_local_cache() if cache_enabled else {}
         if (not check_cache(local_cache)) and (benchmark is not None):
             # re-benchmark everything to try to get consistent numbers from the same machine
             timings = benchmark(choices)
