@@ -1,6 +1,7 @@
 # Owner(s): ["module: inductor"]
 import copy
 import functools
+import gc
 import io
 import os
 import shutil
@@ -311,8 +312,6 @@ class TestAOTInductorPackage(TestCase):
                     # Determine if destructor deletes the files
                     del loaded
                     del loaded_nested
-                    import gc
-
                     gc.collect()
 
                     # In shared mode, the directory should NOT be deleted
@@ -657,6 +656,32 @@ class TestAOTInductorPackage(TestCase):
                     )
                 )
                 self.assertEqual(loaded_metadata.get("dummy"), "moo")
+
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    with zipfile.ZipFile(package_path, "r") as zip_ref:
+                        zip_ref.extractall(temp_dir)
+
+                    loaded_metadata_from_directory = (
+                        torch._C._aoti.AOTIModelPackageLoader.load_metadata_from_package(
+                            temp_dir, "model"
+                        )
+                    )
+                    self.assertEqual(loaded_metadata_from_directory, loaded_metadata)
+
+                    nested_dir = os.path.join(temp_dir, "nested_dir")
+                    os.makedirs(nested_dir)
+                    for item in os.listdir(temp_dir):
+                        if item != "nested_dir":
+                            shutil.move(os.path.join(temp_dir, item), nested_dir)
+
+                    loaded_metadata_from_nested_directory = (
+                        torch._C._aoti.AOTIModelPackageLoader.load_metadata_from_package(
+                            temp_dir, "model"
+                        )
+                    )
+                    self.assertEqual(
+                        loaded_metadata_from_nested_directory, loaded_metadata
+                    )
 
                 device = loaded_metadata["AOTI_DEVICE_KEY"]
                 current_device_info = torch._inductor.codecache.get_device_information(

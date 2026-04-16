@@ -10,6 +10,7 @@
 #include <fmt/format.h>
 #include <miniz.h>
 #include <nlohmann/json.hpp>
+#include <cctype>
 #include <fstream>
 #include <iostream>
 #include <regex>
@@ -23,6 +24,29 @@ namespace fs = c10::filesystem;
 namespace {
 
 const std::string k_separator = "/";
+
+bool is_windows_drive_root(const std::string& path) {
+  return path.size() == 3 &&
+      std::isalpha(static_cast<unsigned char>(path[0])) && path[1] == ':' &&
+      path[2] == '/';
+}
+
+std::string strip_trailing_separator(const std::string& path) {
+  std::string stripped_path = path;
+  while (
+      stripped_path.size() > 1 && c10::ends_with(stripped_path, k_separator) &&
+      !is_windows_drive_root(stripped_path)) {
+    stripped_path.pop_back();
+  }
+  return stripped_path;
+}
+
+std::string append_separator_if_needed(const std::string& path) {
+  if (path.empty() || c10::ends_with(path, k_separator)) {
+    return path;
+  }
+  return path + k_separator;
+}
 
 std::string remove_duplicate_separator_of_path(const std::string& path) {
   /*
@@ -78,7 +102,53 @@ void list_files_recursive(
 
 std::string create_temp_dir() {
   c10::TempDir temp_dir = c10::make_tempdir("aotinductor_");
-  return std::move(temp_dir.name);
+  // Transfer ownership of the temp directory path to the caller explicitly.
+  // TempDir's destructor calls rmdir()/RemoveDirectory(); clearing the name
+  // disables that RAII cleanup and lets callers manage lifecycle via
+  // recursive_rmdir().
+  std::string path = temp_dir.name;
+  temp_dir.name.clear();
+  return path;
+}
+
+std::string detect_file_prefix(const std::vector<std::string>& found_filenames) {
+  if (found_filenames.size() < 2) {
+    return "";
+  }
+
+  size_t pos = found_filenames[0].find('/');
+  std::string prefix0 = found_filenames[0].substr(0, pos);
+  pos = found_filenames[1].find('/');
+  std::string prefix1 = found_filenames[1].substr(0, pos);
+
+  if (!prefix0.empty() && !prefix1.empty() && prefix0 == prefix1) {
+    return prefix0 + "/";
+  }
+
+  return "";
+}
+
+void categorize_model_file(
+    const std::string& filename,
+    std::string& cpp_filename,
+    std::vector<std::string>& obj_filenames,
+    std::string& so_filename,
+    std::string& weight_blob_filename) {
+  size_t extension_idx = filename.find_last_of('.');
+  if (extension_idx == std::string::npos) {
+    return;
+  }
+
+  std::string extension = filename.substr(extension_idx);
+  if (extension == ".cpp") {
+    cpp_filename = filename;
+  } else if (extension == object_file_ext()) {
+    obj_filenames.push_back(filename);
+  } else if (extension == extension_file_ext()) {
+    so_filename = filename;
+  } else if (extension == ".blob") {
+    weight_blob_filename = filename;
+  }
 }
 
 const char* object_file_ext() {
@@ -458,43 +528,107 @@ std::unordered_map<std::string, std::string> AOTIModelPackageLoader::
     load_metadata_from_package(
         const std::string& model_package_path,
         const std::string& model_name) {
-  // Open the zip archive
-  RAIIMinizArchive zip_archive{model_package_path};
-  auto found_filenames{zip_archive.get_filenames()};
-  TORCH_CHECK(!found_filenames.empty(), "No files found in zip archive.");
+  const std::string metadata_suffix = "wrapper_metadata.json";
+  const bool is_directory_mode =
+      fs::is_directory(model_package_path) && !is_zip_file(model_package_path);
 
-  // Find the file prefix (similar to constructor logic)
-  std::string file_prefix;
-  if (found_filenames.size() >= 2) {
-    size_t pos = found_filenames[0].find('/');
-    std::string prefix0 = found_filenames[0].substr(0, pos);
-    pos = found_filenames[1].find('/');
-    std::string prefix1 = found_filenames[1].substr(0, pos);
+  std::vector<std::string> found_filenames;
+  std::string metadata_path;
+  std::string model_directory;
 
-    if (!prefix0.empty() && !prefix1.empty() && prefix0 == prefix1) {
-      file_prefix = prefix0 + "/";
+  if (is_directory_mode) {
+    std::string root_dir = strip_trailing_separator(
+        normalize_path_separator(model_package_path));
+    list_files_recursive(root_dir, found_filenames);
+    TORCH_CHECK(
+        !found_filenames.empty(),
+        "Shared model directory is empty: ",
+        root_dir);
+
+    std::string file_prefix;
+    std::string rel_model_path_suffix = std::string("data") + k_separator +
+        "aotinductor" + k_separator + model_name + k_separator;
+    std::string root_with_sep = append_separator_if_needed(root_dir);
+    for (const auto& path : found_filenames) {
+      size_t pos = path.find(rel_model_path_suffix);
+      if (pos != std::string::npos && c10::starts_with(path, root_with_sep) &&
+          pos >= root_with_sep.length()) {
+        if (pos > root_with_sep.length()) {
+          file_prefix = path.substr(root_with_sep.length(), pos - root_with_sep.length());
+        }
+        break;
+      }
+    }
+
+    model_directory = normalize_path_separator(
+        file_prefix + "data" + k_separator + "aotinductor" + k_separator +
+        model_name);
+    std::string search_model_dir =
+        normalize_path_separator(root_dir + k_separator + model_directory);
+
+    for (const auto& cur_filename : found_filenames) {
+      if (c10::starts_with(cur_filename, search_model_dir) &&
+          c10::ends_with(cur_filename, metadata_suffix)) {
+        metadata_path = cur_filename;
+        break;
+      }
+    }
+  } else {
+    // Open the zip archive.
+    RAIIMinizArchive zip_archive{model_package_path};
+    found_filenames = zip_archive.get_filenames();
+    TORCH_CHECK(!found_filenames.empty(), "No files found in zip archive.");
+
+    std::string file_prefix = detect_file_prefix(found_filenames);
+    model_directory = normalize_path_separator(
+        file_prefix + "data" + k_separator + "aotinductor" + k_separator +
+        model_name);
+
+    std::string metadata_filename;
+    for (auto const& zip_filename_str : found_filenames) {
+      auto cur_filename = normalize_path_separator(zip_filename_str);
+      if (c10::starts_with(cur_filename, model_directory) &&
+          c10::ends_with(cur_filename, metadata_suffix)) {
+        metadata_filename = cur_filename;
+        break;
+      }
+    }
+
+    if (!metadata_filename.empty()) {
+      // Create temporary directory for extraction
+      std::string temp_dir = normalize_path_separator(create_temp_dir());
+      std::string output_path_str =
+          normalize_path_separator(temp_dir + k_separator + metadata_filename);
+
+      // Create the parent directory if it doesn't exist
+      size_t parent_path_idx = output_path_str.find_last_of(k_separator);
+      TORCH_CHECK(
+          parent_path_idx != std::string::npos,
+          "Failed to find parent path in " + output_path_str);
+      std::string parent_path = output_path_str.substr(0, parent_path_idx);
+      TORCH_CHECK(
+          recursive_mkdir(parent_path),
+          "Failed to create directory " + parent_path,
+          ": ",
+          c10::utils::str_error(errno));
+
+      LOG(INFO) << "Extract file: " << metadata_filename << " to "
+                << output_path_str;
+      zip_archive.extract_file(metadata_filename, output_path_str);
+      metadata_path = output_path_str;
+
+      // Clean up temporary directory after metadata is parsed.
+      const nlohmann::json metadata_json_obj = load_json_file(metadata_path);
+      std::unordered_map<std::string, std::string> metadata;
+      for (auto& item : metadata_json_obj.items()) {
+        metadata[item.key()] = item.value().get<std::string>();
+      }
+      recursive_rmdir(temp_dir);
+      return metadata;
     }
   }
 
-  // Construct the expected metadata file path within the zip
-  std::string model_directory = normalize_path_separator(
-      file_prefix + "data" + k_separator + "aotinductor" + k_separator +
-      model_name);
-  std::string metadata_suffix = "wrapper_metadata.json";
-
-  std::string metadata_filename;
-
-  for (auto const& zip_filename_str : found_filenames) {
-    auto cur_filename = normalize_path_separator(zip_filename_str);
-
-    if (c10::starts_with(cur_filename, model_directory) &&
-        c10::ends_with(cur_filename, metadata_suffix)) {
-      metadata_filename = cur_filename;
-      break;
-    }
-  }
-
-  if (metadata_filename.empty()) {
+  if (metadata_path.empty()) {
     std::string found_filenames_str;
     for (const std::string& filename : found_filenames) {
       found_filenames_str += filename + "\n";
@@ -509,43 +643,22 @@ std::unordered_map<std::string, std::string> AOTIModelPackageLoader::
         false,
         "Failed to find a generated cpp file or so file for model '",
         model_name,
-        "' in the zip archive.\n\nAvailable models in the archive:\n",
+        "' in the ",
+        (is_directory_mode ? "directory" : "zip archive"),
+        ".\n\nAvailable models:\n",
         model_names_str,
         "\n\nTo load a specific model, please provide its name using the `model_name` parameter when calling AOTIModelPackageLoader() or torch._inductor.package.load_package.\n\n",
-        "The following files were loaded from the archive:\n",
+        "The following files were found:\n",
         found_filenames_str);
   }
 
-  // Create temporary directory for extraction
-  std::string temp_dir = normalize_path_separator(create_temp_dir());
-  std::string output_path_str =
-      normalize_path_separator(temp_dir + k_separator + metadata_filename);
-
-  // Create the parent directory if it doesn't exist
-  size_t parent_path_idx = output_path_str.find_last_of(k_separator);
-  TORCH_CHECK(
-      parent_path_idx != std::string::npos,
-      "Failed to find parent path in " + output_path_str);
-  std::string parent_path = output_path_str.substr(0, parent_path_idx);
-  TORCH_CHECK(
-      recursive_mkdir(parent_path),
-      "Failed to create directory " + parent_path,
-      ": ",
-      c10::utils::str_error(errno));
-
-  LOG(INFO) << "Extract file: " << metadata_filename << " to "
-            << output_path_str;
-  zip_archive.extract_file(metadata_filename, output_path_str);
-
   // Parse the metadata json file
-  const nlohmann::json metadata_json_obj = load_json_file(output_path_str);
+  const nlohmann::json metadata_json_obj = load_json_file(metadata_path);
 
   std::unordered_map<std::string, std::string> metadata;
   for (auto& item : metadata_json_obj.items()) {
     metadata[item.key()] = item.value().get<std::string>();
   }
-  // Clean up temporary directory
-  recursive_rmdir(temp_dir);
 
   return metadata;
 }
@@ -578,7 +691,8 @@ AOTIModelPackageLoader::AOTIModelPackageLoader(
   if (fs::is_directory(model_package_path) &&
       !is_zip_file(model_package_path)) {
     shared_mode_ = true;
-    temp_dir_ = normalize_path_separator(model_package_path);
+    temp_dir_ = strip_trailing_separator(
+      normalize_path_separator(model_package_path));
 
     list_files_recursive(temp_dir_, found_filenames);
     TORCH_CHECK(
@@ -594,16 +708,15 @@ AOTIModelPackageLoader::AOTIModelPackageLoader(
     // We look for "data/aotinductor/<model_name>/" in the found files.
     std::string rel_model_path_suffix = std::string("data") + k_separator +
         "aotinductor" + k_separator + model_name + k_separator;
+    std::string temp_dir_with_sep = append_separator_if_needed(temp_dir_);
     for (const auto& path : found_filenames) {
       size_t pos = path.find(rel_model_path_suffix);
-      if (pos != std::string::npos && c10::starts_with(path, temp_dir_) &&
-          pos > temp_dir_.length()) {
-        size_t prefix_start = temp_dir_.length();
-        if (prefix_start < path.length() && path[prefix_start] == '/') {
-          prefix_start++;
-        }
-        if (pos > prefix_start) {
-          file_prefix = path.substr(prefix_start, pos - prefix_start);
+      if (pos != std::string::npos &&
+          c10::starts_with(path, temp_dir_with_sep) &&
+          pos >= temp_dir_with_sep.length()) {
+        if (pos > temp_dir_with_sep.length()) {
+          file_prefix =
+              path.substr(temp_dir_with_sep.length(), pos - temp_dir_with_sep.length());
         }
         break;
       }
@@ -623,19 +736,12 @@ AOTIModelPackageLoader::AOTIModelPackageLoader(
     for (auto const& cur_filename : found_filenames) {
       if (c10::starts_with(cur_filename, search_model_dir) ||
           c10::starts_with(cur_filename, search_const_dir)) {
-        size_t extension_idx = cur_filename.find_last_of('.');
-        if (extension_idx != std::string::npos) {
-          std::string ext = cur_filename.substr(extension_idx);
-          if (ext == ".cpp") {
-            cpp_filename = cur_filename;
-          } else if (ext == object_file_ext()) {
-            obj_filenames.push_back(cur_filename);
-          } else if (ext == extension_file_ext()) {
-            so_filename = cur_filename;
-          } else if (ext == ".blob") {
-            weight_blob_filename = cur_filename;
-          }
-        }
+        categorize_model_file(
+            cur_filename,
+            cpp_filename,
+            obj_filenames,
+            so_filename,
+            weight_blob_filename);
       }
     }
 
@@ -649,18 +755,12 @@ AOTIModelPackageLoader::AOTIModelPackageLoader(
 
     // All the paths are prepended with a tmp/ directory. We need to find the
     // prefix.
-    size_t pos = found_filenames[0].find('/');
-    std::string prefix0 = found_filenames[0].substr(0, pos);
-    pos = found_filenames[1].find('/');
-    std::string prefix1 = found_filenames[1].substr(0, pos);
-
-    if (!prefix0.empty() && !prefix1.empty() && prefix0 == prefix1) {
-      file_prefix = prefix0 + '/';
-    } else {
+    file_prefix = detect_file_prefix(found_filenames);
+    if (file_prefix.empty()) {
       LOG(WARNING)
           << "You are using an outdated version of the pt2 archive which do not have a prefix in front of each filename. Example: \n"
-          << found_filenames[0] << '\n'
-          << found_filenames[1];
+          << found_filenames[0]
+          << (found_filenames.size() >= 2 ? "\n" + found_filenames[1] : "");
     }
 
     temp_dir_ = normalize_path_separator(create_temp_dir());
@@ -719,20 +819,12 @@ AOTIModelPackageLoader::AOTIModelPackageLoader(
         zip_archive.extract_file(zip_filename_str, output_path_str);
 
         // Save the file for bookkeeping
-        size_t extension_idx = output_file_path.find_last_of('.');
-        if (extension_idx != std::string::npos) {
-          std::string filename_extension =
-              output_file_path.substr(extension_idx);
-          if (filename_extension == ".cpp") {
-            cpp_filename = output_file_path;
-          } else if (filename_extension == object_file_ext()) {
-            obj_filenames.push_back(output_file_path);
-          } else if (filename_extension == extension_file_ext()) {
-            so_filename = output_file_path;
-          } else if (filename_extension == ".blob") {
-            weight_blob_filename = output_file_path;
-          }
-        }
+        categorize_model_file(
+            output_file_path,
+            cpp_filename,
+            obj_filenames,
+            so_filename,
+            weight_blob_filename);
       }
     }
   }
