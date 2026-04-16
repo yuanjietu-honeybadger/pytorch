@@ -793,11 +793,16 @@ class EnterDeviceContextManagerWithStreamInfoLine(EnterDeviceContextManagerLine)
         else:
             super().codegen(code)
             code.writeline(f"{DEFAULT_STREAM} = torch.cuda.current_stream()")
+            # Update the current-stream registry entry (index 0) so that
+            # custom ops executed during cudagraph capture see the capture
+            # stream, not the stale trace-time default stream.
+            code.writeline(
+                "from torch._dynamo.graph_bytecode_inputs import "
+                "get_external_object_by_index, set_external_object_by_index"
+            )
+            code.writeline(f"set_external_object_by_index(0, {DEFAULT_STREAM})")
 
             if self.num_streams > 1:
-                code.writeline(
-                    "from torch._dynamo.graph_bytecode_inputs import get_external_object_by_index"
-                )
                 for i in range(1, self.num_streams):
                     user_obj_idx = self.stream_idx_to_user_obj_idx[i]
                     code.writeline(
