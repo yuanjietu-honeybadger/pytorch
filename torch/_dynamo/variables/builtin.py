@@ -2004,6 +2004,40 @@ class BuiltinVariable(BaseBuiltinVariable):
                 list(obj.unpack_var_sequence(tx)),
                 mutation_type=ValueMutationNew(),
             )
+
+        # Sequence protocol fallback: type has sq_item but no __iter__.
+        # CPython: tuple()/list() → PySequence_Tuple/List → PyObject_GetIter
+        #          fallback → PySequence_GetItem iteration.
+        if obj is not None:
+            from .object_protocol import (
+                generic_len,
+                type_implements_sq_item,
+                vt_sequence_getitem,
+            )
+
+            try:
+                obj_type = obj.python_type()
+            except NotImplementedError:
+                obj_type = None
+
+            if (
+                obj_type is not None
+                and not hasattr(obj_type, "__iter__")
+                and hasattr(obj_type, "__len__")
+                and type_implements_sq_item(obj_type)
+            ):
+                try:
+                    length = generic_len(tx, obj)
+                    length_val = length.as_python_constant()
+                    items = []
+                    for i in range(length_val):
+                        items.append(
+                            vt_sequence_getitem(tx, obj, ConstantVariable.create(i))
+                        )
+                    return cls(items, mutation_type=ValueMutationNew())
+                except Unsupported:
+                    pass
+
         return None
 
     def _call_iter_tuple_generator(
@@ -2811,6 +2845,33 @@ class BuiltinVariable(BaseBuiltinVariable):
     def call_reversed(
         self, tx: "InstructionTranslator", obj: VariableTracker
     ) -> VariableTracker | None:
+        # CPython: bltinmodule.c reversed_new
+        # 1. __reversed__ dunder (list, tuple, range, deque have this)
+        # 2. Sequence protocol fallback: __len__ + PySequence_GetItem → sq_item
+        #    (str, bytes, bytearray lack __reversed__ and use this path)
+        from .object_protocol import (
+            generic_len,
+            type_implements_sq_item,
+            vt_sequence_getitem,
+        )
+
+        try:
+            obj_type = obj.python_type()
+        except NotImplementedError:
+            obj_type = None
+
+        if (
+            obj_type is not None
+            and not hasattr(obj_type, "__reversed__")
+            and type_implements_sq_item(obj_type)
+        ):
+            length = generic_len(tx, obj)
+            length_val = length.as_python_constant()
+            items = []
+            for i in range(length_val - 1, -1, -1):
+                items.append(vt_sequence_getitem(tx, obj, ConstantVariable.create(i)))
+            return variables.TupleVariable(items)
+
         if obj.has_unpack_var_sequence(tx):
             items = list(reversed(obj.unpack_var_sequence(tx)))
             return variables.TupleVariable(items)
@@ -3392,6 +3453,41 @@ class IterBuiltinVariable(BaseBuiltinVariable):
         ):
             return obj.call_method(tx, "__iter__", [], {})
 
+        # Sequence protocol fallback: type has sq_item but no __iter__.
+        # CPython: PyObject_GetIter falls back to PySequence_GetItem.
+        # https://github.com/python/cpython/blob/v3.13.3/Objects/abstract.c#L2853-L2872
+        # Falls through to the polyfill if the VT doesn't implement sq_item_impl
+        # (e.g. user-defined types where the polyfill's __getitem__ path works).
+        if not rest and not kwargs:
+            from .object_protocol import (
+                generic_len,
+                type_implements_sq_item,
+                vt_sequence_getitem,
+            )
+
+            try:
+                obj_type = obj.python_type()
+            except NotImplementedError:
+                obj_type = None
+
+            if (
+                obj_type is not None
+                and not hasattr(obj_type, "__iter__")
+                and hasattr(obj_type, "__len__")
+                and type_implements_sq_item(obj_type)
+            ):
+                try:
+                    length = generic_len(tx, obj)
+                    length_val = length.as_python_constant()
+                    items = []
+                    for i in range(length_val):
+                        items.append(
+                            vt_sequence_getitem(tx, obj, ConstantVariable.create(i))
+                        )
+                    return variables.ListIteratorVariable(items)
+                except Unsupported:
+                    pass
+
         # General case: inline the polyfill which handles __iter__ and __getitem__
         ret = variables.UserFunctionVariable(
             polyfills.builtins.iter_  # type: ignore[arg-type]
@@ -3463,6 +3559,39 @@ class ListBuiltinVariable(BaseBuiltinVariable):
                 list(obj.unpack_var_sequence(tx)),
                 mutation_type=ValueMutationNew(),
             )
+
+        # Sequence protocol fallback: type has sq_item but no __iter__.
+        # CPython: list() → PySequence_List → PyObject_GetIter fallback →
+        #          PySequence_GetItem iteration.
+        if obj is not None:
+            from .object_protocol import (
+                generic_len,
+                type_implements_sq_item,
+                vt_sequence_getitem,
+            )
+
+            try:
+                obj_type = obj.python_type()
+            except NotImplementedError:
+                obj_type = None
+
+            if (
+                obj_type is not None
+                and not hasattr(obj_type, "__iter__")
+                and hasattr(obj_type, "__len__")
+                and type_implements_sq_item(obj_type)
+            ):
+                try:
+                    length = generic_len(tx, obj)
+                    length_val = length.as_python_constant()
+                    items = []
+                    for i in range(length_val):
+                        items.append(
+                            vt_sequence_getitem(tx, obj, ConstantVariable.create(i))
+                        )
+                    return ListVariable(items, mutation_type=ValueMutationNew())
+                except Unsupported:
+                    pass
 
         arg_types = [type(a).__name__ for a in args]
         unimplemented(
