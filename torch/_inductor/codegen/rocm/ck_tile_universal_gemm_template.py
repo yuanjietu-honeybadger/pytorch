@@ -640,7 +640,6 @@ class CKTileGemmTemplate(CKTileTemplate):
         """
             elif epilogue_type == "CShuffle":
                 return r"""
-            constexpr auto kMemoryOperation = ck_tile::memory_operation_enum::set;
             using DsDataType = ck_tile::tuple<>; // no bias terms for vanilla GEMM
             using DsLayout = ck_tile::tuple<>;
             constexpr auto ELayout = CLayout;
@@ -660,8 +659,7 @@ class CKTileGemmTemplate(CKTileTemplate):
                                                                      WarpTileM,
                                                                      WarpTileN,
                                                                      WarpTileK,
-                                                                     TransposeC,
-                                                                     kMemoryOperation>;
+                                                                     TransposeC>;
 
             using GemmEpilogue = ck_tile::CShuffleEpilogue<EpilogueProblem>;
         """
@@ -764,12 +762,12 @@ class CKTileGemmTemplate(CKTileTemplate):
             # Take at least one from each stratum, then fill remaining quota randomly
             chosen_instances = []
             remaining_budget = config.rocm.ck_tile_max_profiling_configs
-            for key, group in strata.items():
+            for group in strata.values():
                 if remaining_budget > 0 and group:
                     chosen_instances.append(random.choice(group))
                     remaining_budget -= 1
             # Fill remaining budget from all filtered instances (excluding already chosen)
-            chosen_set = set(id(x) for x in chosen_instances)
+            chosen_set = {id(x) for x in chosen_instances}
             remaining = [x for x in filtered_instances if id(x) not in chosen_set]
             if remaining_budget > 0 and remaining:
                 chosen_instances.extend(
